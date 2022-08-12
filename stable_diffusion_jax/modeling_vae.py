@@ -664,3 +664,88 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
 
 class VQModel(VQGANPreTrainedModel):
   module_class = VQModule
+
+
+class DiagonalGaussianDistribution(object):
+    # TODO: should we pass dtype?
+    def __init__(self, parameters, deterministic=False):
+        # Last axis to account for channels-last
+        self.mean, self.logvar = jnp.split(parameters, 2, axis=-1)
+        self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = jnp.exp(0.5 * self.logvar)
+        self.var = jnp.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = jnp.zeros_like(self.mean)
+
+    def sample(self, key):
+        return self.mean + self.std * jax.random.normal(key, self.mean.shape)
+
+    def kl(self, other=None):
+        if self.deterministic:
+            return jnp.array([0.])
+
+        if other is None:
+            return 0.5 * jnp.sum(
+                self.mean ** 2 + self.var - 1.0 - self.logvar,
+                axis=[1, 2, 3]
+            )
+        
+        return 0.5 * jnp.sum(
+            jnp.square(self.mean - other.mean) / other.var
+            + self.var / other.var - 1.0 - self.logvar + other.logvar,
+            axis=[1, 2, 3]
+        )
+
+    def nll(self, sample, axis=[1,2,3]):
+        if self.deterministic:
+            return jnp.array([0.])
+        
+        logtwopi = jnp.log(2.0 * jnp.pi)
+        return 0.5 * jnp.sum(
+            logtwopi + self.logvar + jnp.square(sample - self.mean) / self.var,
+            axis=axis
+        )
+
+    def mode(self):
+        return self.mean
+
+
+class AutoencoderKLModule(nn.Module):
+    config: VAEConfig
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.encoder = Encoder(self.config, dtype=self.dtype)
+        self.decoder = Decoder(self.config, dtype=self.dtype)
+        self.quant_conv = nn.Conv(
+            2 * self.config.embed_dim,
+            kernel_size=(1, 1),
+            strides=(1, 1),
+            padding="VALID",
+            dtype=self.dtype,
+        )
+        self.post_quant_conv = nn.Conv(
+            self.config.z_channels,
+            kernel_size=(1, 1),
+            strides=(1, 1),
+            padding="VALID",
+            dtype=self.dtype,
+        )
+    
+    def encode(self, pixel_values, deterministic: bool = True):
+        hidden_states = self.encoder(pixel_values, deterministic=deterministic)
+        moments = self.quant_conv(hidden_states)
+        posterior = DiagonalGaussianDistribution(moments)
+        return posterior
+    
+    def decode(self, hidden_states, deterministic: bool = True):
+        hidden_states = self.post_quant_conv(hidden_states)
+        hidden_states = self.decoder(hidden_states, deterministic=deterministic)
+        return hidden_states
+
+    def __call__(self, pixel_values, deterministic: bool = True, sample_posterior: bool = True):
+        posterior = self.encode(pixel_values, deterministic=deterministic)
+        hidden_states = posterior.sample() if sample_posterior else posterior.mode()
+        hidden_states = self.decode(hidden_states)
+        return hidden_states, posterior
