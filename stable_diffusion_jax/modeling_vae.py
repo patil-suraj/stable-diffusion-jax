@@ -1,7 +1,8 @@
 # JAX implementation of VQGAN from taming-transformers https://github.com/CompVis/taming-transformers
 
 from functools import partial
-from typing import Tuple
+from typing import List, Mapping, Tuple
+
 import math
 
 import jax
@@ -600,22 +601,36 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
                      dtype=dtype,
                      _do_init=_do_init)
 
+  def rng_key_names(self) -> set[str]:
+    """
+    Subclassing notes: additional rngs the module needs,
+    other than `params`, `dropout`.
+    """
+    return set()
+  
+  def split_rngs(self, keys: List[str], rng: jax.random.PRNGKey) -> Mapping[str, jax.random.PRNGKey]:
+    if rng is None:
+      return None
+    key_names = self.rng_key_names()
+    key_names.update(keys)
+    rngs = jax.random.split(rng, num=len(key_names))
+    return {k: v for k, v in zip(key_names, rngs)}
+
   def init_weights(self, rng: jax.random.PRNGKey,
                    input_shape: Tuple) -> FrozenDict:
     # init input tensors
     pixel_values = jnp.zeros(input_shape, dtype=jnp.float32)
-    params_rng, dropout_rng = jax.random.split(rng)
-    rngs = {"params": params_rng, "dropout": dropout_rng}
+    rngs = self.split_rngs(["params", "dropout"], rng)
 
     return self.module.init(rngs, pixel_values)["params"]
 
   def encode(self,
              pixel_values,
              params: dict = None,
-             dropout_rng: jax.random.PRNGKey = None,
+             rng: jax.random.PRNGKey = None,
              train: bool = False):
     # Handle any PRNG if needed
-    rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+    rngs = self.split_rngs(["dropout"] if train else [], rng)
 
     return self.module.apply({"params": params or self.params},
                              jnp.array(pixel_values),
@@ -626,10 +641,10 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
   def decode(self,
              hidden_states,
              params: dict = None,
-             dropout_rng: jax.random.PRNGKey = None,
+             rng: jax.random.PRNGKey = None,
              train: bool = False):
     # Handle any PRNG if needed
-    rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+    rngs = self.split_rngs(["dropout"] if train else [], rng)
 
     return self.module.apply(
         {"params": params or self.params},
@@ -648,11 +663,11 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
       self,
       pixel_values,
       params: dict = None,
-      dropout_rng: jax.random.PRNGKey = None,
+      rng: jax.random.PRNGKey = None,
       train: bool = False,
   ):
     # Handle any PRNG if needed
-    rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+    rngs = self.split_rngs(["dropout"] if train else [], rng)
 
     return self.module.apply(
         {"params": params or self.params},
@@ -746,6 +761,21 @@ class AutoencoderKLModule(nn.Module):
 
     def __call__(self, pixel_values, deterministic: bool = True, sample_posterior: bool = True):
         posterior = self.encode(pixel_values, deterministic=deterministic)
-        hidden_states = posterior.sample() if sample_posterior else posterior.mode()
+        if sample_posterior:
+            rng = self.make_rng('gaussian')
+            hidden_states = posterior.sample(rng)
+        else:
+            hidden_states = posterior.mode()
         hidden_states = self.decode(hidden_states)
         return hidden_states, posterior
+
+
+class KLVAEModel(VQGANPreTrainedModel):
+  config_class = VAEConfig
+  base_model_prefix = "model"
+  module_class = AutoencoderKLModule
+
+  def rng_key_names(self) -> set[str]:
+    s = super().rng_key_names()
+    s.add("gaussian")
+    return s
