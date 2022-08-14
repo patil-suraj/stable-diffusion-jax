@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from scheduling_pndm import PNDMScheduler
+from PIL import Image
 
 from transformers import CLIPTokenizer, FlaxCLIPTextModel
 
@@ -15,6 +16,18 @@ class FlaxLDMTextToImagePipeline:
         self.tokenizer = tokenizer
         self.unet = unet
         self.scheduler = scheduler
+
+    def numpy_to_pil(images):
+        """
+        Convert a numpy image or a batch of images to a PIL image.
+        """
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = (images * 255).round().astype("uint8")
+        pil_images = [Image.fromarray(image) for image in images]
+
+        return pil_images
+
 
     def __call__(
         self,
@@ -47,13 +60,13 @@ class FlaxLDMTextToImagePipeline:
             uncond_input=None,
         ):
             if guidance_scale != 1.0:
-                uncond_embeddings = self.bert(uncond_input.input_ids)[0]
+                uncond_embeddings = self.clip(uncond_input.input_ids)[0]
 
-            text_embeddings = self.bert(text_input.input_ids)[0]
+            text_embeddings = self.clip(text_input.input_ids)[0]
 
             latents = jax.random.normal(
                 prng_seed,
-                shape=(text_input.shape[0], self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
+                shape=(text_input.input_ids.shape[0], self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
                 dtype=jnp.float32
             )
 
@@ -73,8 +86,8 @@ class FlaxLDMTextToImagePipeline:
                     # For classifier free guidance, we need to do two forward passes.
                     # Here we concatenate the unconditional and text embeddings into a single batch
                     # to avoid doing two forward passes
-                    latents_input = torch.cat([latents] * 2)
-                    context = torch.cat([uncond_embeddings, text_embeddings])
+                    latents_input = jnp.concatenate([latents] * 2)
+                    context = jnp.concatenate([uncond_embeddings, text_embeddings])
 
                 # predict the noise residual
                 noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
@@ -114,6 +127,8 @@ clip_model = FlaxCLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 
 
 class DummyUnet(nn.Module):
+    in_channels = 3
+    sample_size = 1
 
     @nn.compact
     def __call__(self, latents_input, t, encoder_hidden_states):
@@ -126,3 +141,7 @@ scheduler = PNDMScheduler()
 pipeline = FlaxLDMTextToImagePipeline(vqvae=None, clip=clip_model, tokenizer=tokenizer, unet=unet, scheduler=scheduler)
 
 # now running the pipeline should work more or less which it doesn't at the moment @Nathan
+key = jax.random.PRNGKey(0)
+
+prompt = "A painting of a squirrel eating a burger"
+images = pipeline([prompt], prng_seed=key, num_inference_steps=50, eta=0.3, guidance_scale=6)["sample"]
