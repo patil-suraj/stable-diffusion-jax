@@ -574,12 +574,12 @@ class VQModule(nn.Module):
     return hidden_states, indices
 
 
-class VQGANPreTrainedModel(FlaxPreTrainedModel):
+class VAEPreTrainedModel(FlaxPreTrainedModel):
   """
-    An abstract class to handle weights initialization and a simple interface
-    for downloading and loading pretrained models.
-    """
-
+  An abstract class to handle weights initialization, with a simple interface
+  for downloading and loading pretrained models, and general-purpose
+  encoding and decoding interface.
+  """
   config_class = VAEConfig
   base_model_prefix = "model"
   module_class: nn.Module = None
@@ -654,11 +654,6 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
         method=self.module.decode,
     )
 
-  def decode_code(self, indices, params: dict = None):
-    return self.module.apply({"params": params or self.params},
-                             jnp.array(indices, dtype="i4"),
-                             method=self.module.decode_code)
-
   def __call__(
       self,
       pixel_values,
@@ -677,8 +672,13 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
     )
 
 
-class VQModel(VQGANPreTrainedModel):
+class VQModel(VAEPreTrainedModel):
   module_class = VQModule
+
+  def decode_code(self, indices, params: dict = None):
+    return self.module.apply({"params": params or self.params},
+                             jnp.array(indices, dtype="i4"),
+                             method=self.module.decode_code)
 
 
 class DiagonalGaussianDistribution(object):
@@ -748,18 +748,18 @@ class AutoencoderKLModule(nn.Module):
             dtype=self.dtype,
         )
     
-    def encode(self, pixel_values, deterministic: bool = True):
+    def encode(self, pixel_values, deterministic = True):
         hidden_states = self.encoder(pixel_values, deterministic=deterministic)
         moments = self.quant_conv(hidden_states)
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
     
-    def decode(self, hidden_states, deterministic: bool = True):
+    def decode(self, hidden_states, deterministic = True):
         hidden_states = self.post_quant_conv(hidden_states)
         hidden_states = self.decoder(hidden_states, deterministic=deterministic)
         return hidden_states
 
-    def __call__(self, pixel_values, deterministic: bool = True, sample_posterior: bool = True):
+    def __call__(self, pixel_values, deterministic = True, sample_posterior = True):
         posterior = self.encode(pixel_values, deterministic=deterministic)
         if sample_posterior:
             rng = self.make_rng('gaussian')
@@ -770,7 +770,7 @@ class AutoencoderKLModule(nn.Module):
         return hidden_states, posterior
 
 
-class KLVAEModel(VQGANPreTrainedModel):
+class KLVAEModel(VAEPreTrainedModel):
   config_class = VAEConfig
   base_model_prefix = "model"
   module_class = AutoencoderKLModule
