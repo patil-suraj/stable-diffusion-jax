@@ -748,18 +748,18 @@ class AutoencoderKLModule(nn.Module):
             dtype=self.dtype,
         )
     
-    def encode(self, pixel_values, deterministic = True):
+    def encode(self, pixel_values, deterministic=True):
         hidden_states = self.encoder(pixel_values, deterministic=deterministic)
         moments = self.quant_conv(hidden_states)
         posterior = DiagonalGaussianDistribution(moments)
         return posterior
     
-    def decode(self, hidden_states, deterministic = True):
+    def decode(self, hidden_states, deterministic=True):
         hidden_states = self.post_quant_conv(hidden_states)
         hidden_states = self.decoder(hidden_states, deterministic=deterministic)
         return hidden_states
 
-    def __call__(self, pixel_values, deterministic = True, sample_posterior = True):
+    def __call__(self, pixel_values, deterministic=True, sample_posterior=False):
         posterior = self.encode(pixel_values, deterministic=deterministic)
         if sample_posterior:
             rng = self.make_rng('gaussian')
