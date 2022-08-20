@@ -143,7 +143,7 @@ class SpatialTransformer(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.norm = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.norm = nn.GroupNorm(num_groups=32, epsilon=1e-5)
 
         inner_dim = self.n_heads * self.d_head
         self.proj_in = nn.Conv(
@@ -268,7 +268,7 @@ class ResnetBlock(nn.Module):
     def setup(self):
         out_channels = self.in_channels if self.out_channels is None else self.out_channels
 
-        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-5)
         self.conv1 = nn.Conv(
             out_channels,
             kernel_size=(3, 3),
@@ -279,7 +279,7 @@ class ResnetBlock(nn.Module):
 
         self.temb_proj = nn.Dense(out_channels, dtype=self.dtype)
 
-        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-5)
         self.dropout = nn.Dropout(self.dropout_prob)
         self.conv2 = nn.Conv(
             out_channels,
@@ -669,7 +669,7 @@ class UNet2DModule(nn.Module):
         self.up_blocks = up_blocks
 
         # out
-        self.conv_norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-5)
         self.conv_out = nn.Conv(
             config.out_channels,
             kernel_size=(3, 3),
@@ -746,7 +746,7 @@ class UNet2DPretrainedModel(FlaxPreTrainedModel):
         sample = jnp.zeros(sample_shape, dtype=jnp.float32)
         timestpes = jnp.ones((1,), dtype=jnp.int32)
         encoder_hidden_states = jnp.zeros((1, 1, self.config.cross_attention_dim), dtype=jnp.float32)
-        
+
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
