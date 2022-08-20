@@ -533,11 +533,12 @@ class AutoencoderKLPreTrainedModel(FlaxPreTrainedModel):
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple) -> FrozenDict:
         # init input tensors
-        pixel_values = jnp.zeros(input_shape, dtype=jnp.float32)
+        sample_shape = (1, self.config.sample_size, self.config.sample_size, self.config.in_channels)
+        sample = jnp.zeros(sample_shape, dtype=jnp.float32)
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
-        return self.module.init(rngs, pixel_values)["params"]
+        return self.module.init(rngs, sample)["params"]
 
     def encode(self, pixel_values, params: dict = None, dropout_rng: jax.random.PRNGKey = None, train: bool = False):
         # Handle any PRNG if needed
