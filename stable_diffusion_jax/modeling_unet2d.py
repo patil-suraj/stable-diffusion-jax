@@ -19,132 +19,9 @@ def get_sinusoidal_embeddings(timesteps, embedding_dim):
     return emb
 
 
-class Timesteps(nn.Module):
-    dim: int = 32
-
-    @nn.compact
-    def __call__(self, timesteps):
-        return get_sinusoidal_embeddings(timesteps, self.dim)
-
-
-class TimestepEmbedding(nn.Module):
-    time_embed_dim: int = 32
-    dtype: jnp.dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, temb):
-        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_1")(temb)
-        temb = nn.silu(temb)
-        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_2")(temb)
-        return temb
-
-
-class Upsample(nn.Module):
-    out_channels: int
-    dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        self.conv = nn.Conv(
-            self.out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-    def __call__(self, hidden_states):
-        batch, height, width, channels = hidden_states.shape
-        hidden_states = jax.image.resize(
-            hidden_states,
-            shape=(batch, height * 2, width * 2, channels),
-            method="nearest",
-        )
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
-
-
-class Downsample(nn.Module):
-    out_channels: int
-    dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        self.conv = nn.Conv(
-            self.out_channels,
-            kernel_size=(3, 3),
-            strides=(2, 2),
-            padding=((1, 1), (1, 1)),  # padding="VALID",
-            dtype=self.dtype,
-        )
-
-    def __call__(self, hidden_states):
-        # pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
-        # hidden_states = jnp.pad(hidden_states, pad_width=pad)
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
-
-
-class ResnetBlock(nn.Module):
-    in_channels: int
-    out_channels: int = None
-    dropout_prob: float = 0.0
-    use_nin_shortcut: bool = None
-    dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        out_channels = self.in_channels if self.out_channels is None else self.out_channels
-
-        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
-        self.conv1 = nn.Conv(
-            out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        self.temb_proj = nn.Dense(out_channels, dtype=self.dtype)
-
-        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
-        self.dropout = nn.Dropout(self.dropout_prob)
-        self.conv2 = nn.Conv(
-            out_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-        use_nin_shortcut = self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
-
-        self.conv_shortcut = None
-        if use_nin_shortcut:
-            self.conv_shortcut = nn.Conv(
-                out_channels,
-                kernel_size=(1, 1),
-                strides=(1, 1),
-                padding="VALID",
-                dtype=self.dtype,
-            )
-
-    def __call__(self, hidden_states, temb, deterministic=True):
-        residual = hidden_states
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.conv1(hidden_states)
-
-        temb = self.temb_proj(nn.swish(temb))
-        temb = jnp.broadcast_to(temb, (temb.shape[0], 1, 1, temb.shape[-1]))
-        hidden_states = hidden_states + temb
-
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.dropout(hidden_states, deterministic)
-        hidden_states = self.conv2(hidden_states)
-
-        if self.conv_shortcut is not None:
-            residual = self.conv_shortcut(residual)
-
-        return hidden_states + residual
+##############################################################################################
+# Transformer Blocks
+##############################################################################################
 
 
 class Attention(nn.Module):
@@ -310,6 +187,139 @@ class SpatialTransformer(nn.Module):
         hidden_states = hidden_states + residual
 
         return hidden_states
+
+
+##############################################################################################
+# UNet Blocks
+##############################################################################################
+
+
+class Timesteps(nn.Module):
+    dim: int = 32
+
+    @nn.compact
+    def __call__(self, timesteps):
+        return get_sinusoidal_embeddings(timesteps, self.dim)
+
+
+class TimestepEmbedding(nn.Module):
+    time_embed_dim: int = 32
+    dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, temb):
+        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_1")(temb)
+        temb = nn.silu(temb)
+        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_2")(temb)
+        return temb
+
+
+class Upsample(nn.Module):
+    out_channels: int
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.conv = nn.Conv(
+            self.out_channels,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            dtype=self.dtype,
+        )
+
+    def __call__(self, hidden_states):
+        batch, height, width, channels = hidden_states.shape
+        hidden_states = jax.image.resize(
+            hidden_states,
+            shape=(batch, height * 2, width * 2, channels),
+            method="nearest",
+        )
+        hidden_states = self.conv(hidden_states)
+        return hidden_states
+
+
+class Downsample(nn.Module):
+    out_channels: int
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.conv = nn.Conv(
+            self.out_channels,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding=((1, 1), (1, 1)),  # padding="VALID",
+            dtype=self.dtype,
+        )
+
+    def __call__(self, hidden_states):
+        # pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
+        # hidden_states = jnp.pad(hidden_states, pad_width=pad)
+        hidden_states = self.conv(hidden_states)
+        return hidden_states
+
+
+class ResnetBlock(nn.Module):
+    in_channels: int
+    out_channels: int = None
+    dropout_prob: float = 0.0
+    use_nin_shortcut: bool = None
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        out_channels = self.in_channels if self.out_channels is None else self.out_channels
+
+        self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv1 = nn.Conv(
+            out_channels,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            dtype=self.dtype,
+        )
+
+        self.temb_proj = nn.Dense(out_channels, dtype=self.dtype)
+
+        self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.dropout = nn.Dropout(self.dropout_prob)
+        self.conv2 = nn.Conv(
+            out_channels,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            dtype=self.dtype,
+        )
+
+        use_nin_shortcut = self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
+
+        self.conv_shortcut = None
+        if use_nin_shortcut:
+            self.conv_shortcut = nn.Conv(
+                out_channels,
+                kernel_size=(1, 1),
+                strides=(1, 1),
+                padding="VALID",
+                dtype=self.dtype,
+            )
+
+    def __call__(self, hidden_states, temb, deterministic=True):
+        residual = hidden_states
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = nn.swish(hidden_states)
+        hidden_states = self.conv1(hidden_states)
+
+        temb = self.temb_proj(nn.swish(temb))
+        temb = jnp.broadcast_to(temb, (temb.shape[0], 1, 1, temb.shape[-1]))
+        hidden_states = hidden_states + temb
+
+        hidden_states = self.norm2(hidden_states)
+        hidden_states = nn.swish(hidden_states)
+        hidden_states = self.dropout(hidden_states, deterministic)
+        hidden_states = self.conv2(hidden_states)
+
+        if self.conv_shortcut is not None:
+            residual = self.conv_shortcut(residual)
+
+        return hidden_states + residual
 
 
 class CrossAttnDownBlock2D(nn.Module):
