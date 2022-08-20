@@ -39,7 +39,7 @@ class Attention(nn.Module):
         self.to_k = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype)
         self.to_v = nn.Dense(inner_dim, use_bias=False, dtype=self.dtype)
 
-        self.to_out = nn.Dense(self.query_dim, use_bias=False, dtype=self.dtype)
+        self.to_out = nn.Dense(self.query_dim, dtype=self.dtype)
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -107,9 +107,9 @@ class TransformerBlock(nn.Module):
 
     def setup(self):
         # self attention
-        self.attn1 = Attention(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
+        self.self_attn = Attention(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
         # cross attention
-        self.attn2 = Attention(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
+        self.cross_attn = Attention(self.dim, self.n_heads, self.d_head, self.dropout, dtype=self.dtype)
         self.ff = GluFeedForward(dim=self.dim, dropout=self.dropout, dtype=self.dtype)
         self.norm1 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
         self.norm2 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
@@ -118,12 +118,12 @@ class TransformerBlock(nn.Module):
     def __call__(self, hidden_states, context, deterministic=True):
         # self attention
         residual = hidden_states
-        hidden_states = self.attn1(self.norm1(hidden_states))
+        hidden_states = self.self_attn(self.norm1(hidden_states))
         hidden_states = hidden_states + residual
 
         # cross attention
         residual = hidden_states
-        hidden_states = self.attn2(self.norm2(hidden_states), context)
+        hidden_states = self.cross_attn(self.norm2(hidden_states), context)
         hidden_states = hidden_states + residual
 
         # feed forward
@@ -277,7 +277,7 @@ class ResnetBlock(nn.Module):
             dtype=self.dtype,
         )
 
-        self.temb_proj = nn.Dense(out_channels, dtype=self.dtype)
+        self.time_emb_proj = nn.Dense(out_channels, dtype=self.dtype)
 
         self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-5)
         self.dropout = nn.Dropout(self.dropout_prob)
@@ -307,7 +307,7 @@ class ResnetBlock(nn.Module):
         hidden_states = nn.swish(hidden_states)
         hidden_states = self.conv1(hidden_states)
 
-        temb = self.temb_proj(nn.swish(temb))
+        temb = self.time_emb_proj(nn.swish(temb))
         temb = jnp.broadcast_to(temb, (temb.shape[0], 1, 1, temb.shape[-1]))
         hidden_states = hidden_states + temb
 
