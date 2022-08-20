@@ -23,6 +23,7 @@ class UNet2DConfig(PretrainedConfig):
         attention_head_dim=8,
         norm_num_groups=32,
         norm_eps=1e-5,
+        dropout=0.1,
     ):
         self.sample_size = sample_size
         self.in_channels = in_channels
@@ -41,5 +42,6 @@ class UNet2DConfig(PretrainedConfig):
         self.attention_head_dim = attention_head_dim
         self.norm_num_groups = norm_num_groups
         self.norm_eps = norm_eps
+        self.dropout = dropout
         
         super().__init__()
