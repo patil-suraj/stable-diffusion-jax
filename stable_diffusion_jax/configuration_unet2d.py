@@ -27,4 +27,3 @@ class UNet2DConfig(PretrainedConfig):
         self.attention_head_dim = attention_head_dim
         self.cross_attention_dim = cross_attention_dim
         self.dropout = dropout
-
