@@ -16,18 +16,16 @@ from .configuration_vae import VAEConfig
 
 class Upsample(nn.Module):
     in_channels: int
-    with_conv: bool
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        if self.with_conv:
-            self.conv = nn.Conv(
-                self.in_channels,
-                kernel_size=(3, 3),
-                strides=(1, 1),
-                padding=((1, 1), (1, 1)),
-                dtype=self.dtype,
-            )
+        self.conv = nn.Conv(
+            self.in_channels,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            dtype=self.dtype,
+        )
 
     def __call__(self, hidden_states):
         batch, height, width, channels = hidden_states.shape
@@ -36,265 +34,258 @@ class Upsample(nn.Module):
             shape=(batch, height * 2, width * 2, channels),
             method="nearest",
         )
-        if self.with_conv:
-            hidden_states = self.conv(hidden_states)
+        hidden_states = self.conv(hidden_states)
         return hidden_states
 
 
 class Downsample(nn.Module):
     in_channels: int
-    with_conv: bool
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        if self.with_conv:
-            self.conv = nn.Conv(
-                self.in_channels,
-                kernel_size=(3, 3),
-                strides=(2, 2),
-                padding="VALID",
-                dtype=self.dtype,
-            )
+        self.conv = nn.Conv(
+            self.in_channels,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding="VALID",
+            dtype=self.dtype,
+        )
 
     def __call__(self, hidden_states):
-        if self.with_conv:
-            pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
-            hidden_states = jnp.pad(hidden_states, pad_width=pad)
-            hidden_states = self.conv(hidden_states)
-        else:
-            hidden_states = nn.avg_pool(hidden_states, window_shape=(2, 2), strides=(2, 2), padding="VALID")
+        pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
+        hidden_states = jnp.pad(hidden_states, pad_width=pad)
+        hidden_states = self.conv(hidden_states)
         return hidden_states
 
 
 class ResnetBlock(nn.Module):
     in_channels: int
     out_channels: int = None
-    use_conv_shortcut: bool = False
-    temb_channels: int = 512
     dropout_prob: float = 0.0
+    use_nin_shortcut: bool = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.out_channels_ = self.in_channels if self.out_channels is None else self.out_channels
+        out_channels = self.in_channels if self.out_channels is None else self.out_channels
 
         self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
         self.conv1 = nn.Conv(
-            self.out_channels_,
+            out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
-
-        if self.temb_channels:
-            self.temb_proj = nn.Dense(self.out_channels_, dtype=self.dtype)
 
         self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
         self.dropout = nn.Dropout(self.dropout_prob)
         self.conv2 = nn.Conv(
-            self.out_channels_,
+            out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
 
-        if self.in_channels != self.out_channels_:
-            if self.use_conv_shortcut:
-                self.conv_shortcut = nn.Conv(
-                    self.out_channels_,
-                    kernel_size=(3, 3),
-                    strides=(1, 1),
-                    padding=((1, 1), (1, 1)),
-                    dtype=self.dtype,
-                )
-            else:
-                self.nin_shortcut = nn.Conv(
-                    self.out_channels_,
-                    kernel_size=(1, 1),
-                    strides=(1, 1),
-                    padding="VALID",
-                    dtype=self.dtype,
-                )
+        use_nin_shortcut = self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
 
-    def __call__(self, hidden_states, temb=None, deterministic: bool = True):
+        self.conv_shortcut = None
+        if use_nin_shortcut:
+            self.conv_shortcut = nn.Conv(
+                out_channels,
+                kernel_size=(1, 1),
+                strides=(1, 1),
+                padding="VALID",
+                dtype=self.dtype,
+            )
+
+    def __call__(self, hidden_states, deterministic=True):
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
         hidden_states = nn.swish(hidden_states)
         hidden_states = self.conv1(hidden_states)
-
-        if temb is not None:
-            hidden_states = hidden_states + self.temb_proj(nn.swish(temb))[:, :, None, None]  # TODO: check shapes
 
         hidden_states = self.norm2(hidden_states)
         hidden_states = nn.swish(hidden_states)
         hidden_states = self.dropout(hidden_states, deterministic)
         hidden_states = self.conv2(hidden_states)
 
-        if self.in_channels != self.out_channels_:
-            if self.use_conv_shortcut:
-                residual = self.conv_shortcut(residual)
-            else:
-                residual = self.nin_shortcut(residual)
+        if self.conv_shortcut is not None:
+            residual = self.conv_shortcut(residual)
 
         return hidden_states + residual
 
 
 class AttnBlock(nn.Module):
-    in_channels: int
+    channels: int
+    num_head_channels: int = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        conv = partial(
-            nn.Conv, self.in_channels, kernel_size=(1, 1), strides=(1, 1), padding="VALID", dtype=self.dtype
-        )
+        self.num_heads = self.channels // self.num_head_channels if self.num_head_channels is not None else 1
 
-        self.norm = nn.GroupNorm(num_groups=32, epsilon=1e-6)
-        self.q, self.k, self.v = conv(), conv(), conv()
-        self.proj_out = conv()
+        dense = partial(nn.Dense, self.channels, dtype=self.dtype)
+
+        self.group_norm = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.query, self.key, self.value = dense(), dense(), dense()
+        self.proj_attn = dense()
+
+    def transpose_for_scores(self, projection):
+        new_projection_shape = projection.shape[:-1] + (self.num_heads, -1)
+        # move heads to 2nd position (B, T, H * D) -> (B, T, H, D)
+        new_projection = projection.reshape(new_projection_shape)
+        # (B, T, H, D) -> (B, H, T, D)
+        new_projection = jnp.transpose(new_projection, (0, 2, 1, 3))
+        return new_projection
 
     def __call__(self, hidden_states):
         residual = hidden_states
-        hidden_states = self.norm(hidden_states)
+        batch, height, width, channels = query.shape
 
-        query = self.q(hidden_states)
-        key = self.k(hidden_states)
-        value = self.v(hidden_states)
+        hidden_states = self.group_norm(hidden_states)
+
+        hidden_states = hidden_states.reshape((batch, height * width, channels))
+
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)
+        value = self.value(hidden_states)
+
+        # transpose
+        query = self.transpose_for_scores(query)
+        key = self.transpose_for_scores(key)
+        value = self.transpose_for_scores(value)
 
         # compute attentions
-        batch, height, width, channels = query.shape
-        query = query.reshape((batch, height * width, channels))
-        key = key.reshape((batch, height * width, channels))
-        attn_weights = jnp.einsum("...qc,...kc->...qk", query, key)
-        attn_weights = attn_weights * (int(channels) ** -0.5)
+        scale = 1 / math.sqrt(math.sqrt(self.channels / self.num_heads))
+        attn_weights = jnp.einsum("...qc,...kc->...qk", query * scale, key * scale)
         attn_weights = nn.softmax(attn_weights, axis=2)
 
-        ## attend to values
-        value = value.reshape((batch, height * width, channels))
+        # attend to values
         hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
-        hidden_states = hidden_states.reshape((batch, height, width, channels))
 
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = jnp.transpose(hidden_states, (0, 2, 1, 3))
+        new_hidden_states_shape = hidden_states.shape[:-2] + (self.channels,)
+        hidden_states = hidden_states.reshape(new_hidden_states_shape)
+
+        hidden_states = self.proj_attn(hidden_states)
         hidden_states = hidden_states + residual
         return hidden_states
 
 
-class UpsamplingBlock(nn.Module):
-    config: VAEConfig
-    curr_res: int
-    block_idx: int
+class DownBlock2D(nn.Module):
+    in_channels: int
+    out_channels: int
+    dropout: float = 0.0
+    num_layers: int = 1
+    add_downsample: bool = True
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        if self.block_idx == self.config.num_resolutions - 1:
-            block_in = self.config.ch * self.config.ch_mult[-1]
-        else:
-            block_in = self.config.ch * self.config.ch_mult[self.block_idx + 1]
+        resnets = []
+        for i in range(self.num_layers):
+            in_channels = self.in_channels if i == 0 else self.out_channels
 
-        block_out = self.config.ch * self.config.ch_mult[self.block_idx]
-        self.temb_ch = 0
-
-        res_blocks = []
-        attn_blocks = []
-        for _ in range(self.config.num_res_blocks + 1):
-            res_blocks.append(
-                ResnetBlock(
-                    block_in, block_out, temb_channels=self.temb_ch, dropout_prob=self.config.dropout, dtype=self.dtype
-                )
+            res_block = ResnetBlock(
+                in_channels=in_channels,
+                out_channels=self.out_channels,
+                dropout_prob=self.dropout,
+                dtype=self.dtype,
             )
-            block_in = block_out
-            if self.curr_res in self.config.attn_resolutions:
-                attn_blocks.append(AttnBlock(block_in, dtype=self.dtype))
+            resnets.append(res_block)
+        self.resnets = resnets
 
-        self.block = res_blocks
-        self.attn = attn_blocks
+        if self.add_downsample:
+            self.downsample = Downsample(self.out_channels, dtype=self.dtype)
 
-        self.upsample = None
-        if self.block_idx != 0:
-            self.upsample = Upsample(block_in, self.config.resamp_with_conv, dtype=self.dtype)
+    def __call__(self, hidden_states, deterministic=True):
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states, deterministic=deterministic)
 
-    def __call__(self, hidden_states, temb=None, deterministic: bool = True):
-        for i, res_block in enumerate(self.block):
-            hidden_states = res_block(hidden_states, temb, deterministic=deterministic)
-            if self.attn:
-                hidden_states = self.attn[i](hidden_states)
-
-        if self.upsample is not None:
-            hidden_states = self.upsample(hidden_states)
-
-        return hidden_states
-
-
-class DownsamplingBlock(nn.Module):
-    config: VAEConfig
-    curr_res: int
-    block_idx: int
-    dtype: jnp.dtype = jnp.float32
-
-    def setup(self):
-        in_ch_mult = (1,) + tuple(self.config.ch_mult)
-        block_in = self.config.ch * in_ch_mult[self.block_idx]
-        block_out = self.config.ch * self.config.ch_mult[self.block_idx]
-        self.temb_ch = 0
-
-        res_blocks = []
-        attn_blocks = []
-        for _ in range(self.config.num_res_blocks):
-            res_blocks.append(
-                ResnetBlock(
-                    block_in, block_out, temb_channels=self.temb_ch, dropout_prob=self.config.dropout, dtype=self.dtype
-                )
-            )
-            block_in = block_out
-            if self.curr_res in self.config.attn_resolutions:
-                attn_blocks.append(AttnBlock(block_in, dtype=self.dtype))
-
-        self.block = res_blocks
-        self.attn = attn_blocks
-
-        self.downsample = None
-        if self.block_idx != self.config.num_resolutions - 1:
-            self.downsample = Downsample(block_in, self.config.resamp_with_conv, dtype=self.dtype)
-
-    def __call__(self, hidden_states, temb=None, deterministic: bool = True):
-        for i, res_block in enumerate(self.block):
-            hidden_states = res_block(hidden_states, temb, deterministic=deterministic)
-            if self.attn:
-                hidden_states = self.attn[i](hidden_states)
-
-        if self.downsample is not None:
+        if self.add_downsample:
             hidden_states = self.downsample(hidden_states)
 
         return hidden_states
 
 
-class MidBlock(nn.Module):
+class UpBlock2D(nn.Module):
     in_channels: int
-    temb_channels: int
-    dropout: float
+    out_channels: int
+    dropout: float = 0.0
+    num_layers: int = 1
+    add_upsample: bool = True
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.block_1 = ResnetBlock(
-            self.in_channels,
-            self.in_channels,
-            temb_channels=self.temb_channels,
-            dropout_prob=self.dropout,
-            dtype=self.dtype,
-        )
-        self.attn_1 = AttnBlock(self.in_channels, dtype=self.dtype)
-        self.block_2 = ResnetBlock(
-            self.in_channels,
-            self.in_channels,
-            temb_channels=self.temb_channels,
-            dropout_prob=self.dropout,
-            dtype=self.dtype,
-        )
+        resnets = []
+        for i in range(self.num_layers):
+            in_channels = self.in_channels if i == 0 else self.out_channels
 
-    def __call__(self, hidden_states, temb=None, deterministic: bool = True):
-        hidden_states = self.block_1(hidden_states, temb, deterministic=deterministic)
-        hidden_states = self.attn_1(hidden_states)
-        hidden_states = self.block_2(hidden_states, temb, deterministic=deterministic)
+            res_block = ResnetBlock(
+                in_channels=in_channels,
+                out_channels=self.out_channels,
+                dropout_prob=self.dropout,
+                dtype=self.dtype,
+            )
+            resnets.append(res_block)
+
+        self.resnets = resnets
+
+        if self.add_upsample:
+            self.upsample = Upsample(self.out_channels, dtype=self.dtype)
+
+    def __call__(self, hidden_states, deterministic=True):
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states, deterministic=deterministic)
+
+        if self.add_upsample:
+            hidden_states = self.upsample(hidden_states)
+
+        return hidden_states
+
+
+class UNetMidBlock2D(nn.Module):
+    in_channels: int
+    dropout: float = 0.0
+    num_layers: int = 1
+    attn_num_head_channels: int = 1
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        # there is always at least one resnet
+        resnets = [
+            ResnetBlock(
+                in_channels=self.in_channels,
+                out_channels=self.in_channels,
+                dropout_prob=self.dropout,
+                dtype=self.dtype,
+            )
+        ]
+
+        attentions = []
+
+        for _ in range(self.num_layers):
+            attn_block = AttnBlock(
+                channels=self.in_channels, num_head_channels=self.attn_num_head_channels, dtype=self.dtype
+            )
+            attentions.append(attn_block)
+
+            res_block = ResnetBlock(
+                in_channels=self.in_channels,
+                out_channels=self.in_channels,
+                dropout_prob=self.dropout,
+                dtype=self.dtype,
+            )
+            resnets.append(res_block)
+
+        self.resnets = resnets
+        self.attentions = attentions
+
+    def __call__(self, hidden_states, deterministic=True):
+        hidden_states = self.resnets[0](hidden_states, deterministic=deterministic)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+            hidden_states = attn(hidden_states)
+            hidden_states = resnet(hidden_states, deterministic=deterministic)
+
         return hidden_states
 
 
@@ -303,58 +294,67 @@ class Encoder(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.temb_ch = 0
-
-        # downsampling
+        block_out_channels = self.config.block_out_channels
+        # in
         self.conv_in = nn.Conv(
-            self.config.ch,
+            block_out_channels[0],
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
-
-        curr_res = self.config.resolution
-        downsample_blocks = []
-        for i_level in range(self.config.num_resolutions):
-            downsample_blocks.append(DownsamplingBlock(self.config, curr_res, block_idx=i_level, dtype=self.dtype))
-
-            if i_level != self.config.num_resolutions - 1:
-                curr_res = curr_res // 2
-        self.down = downsample_blocks
-
-        # middle
-        mid_channels = self.config.ch * self.config.ch_mult[-1]
-        self.mid = MidBlock(mid_channels, self.temb_ch, self.config.dropout, dtype=self.dtype)
-
-        # end
-        self.norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-6)
-        self.conv_out = nn.Conv(
-            2 * self.config.z_channels if self.config.double_z else self.config.z_channels,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding=((1, 1), (1, 1)),
-            dtype=self.dtype,
-        )
-
-    def __call__(self, pixel_values, deterministic: bool = True):
-        # timestep embedding
-        temb = None
 
         # downsampling
-        hidden_states = self.conv_in(pixel_values)
-        for block in self.down:
-            hidden_states = block(hidden_states, temb, deterministic=deterministic)
+        down_blocks = []
+        output_channel = block_out_channels[0]
+        for i, _ in enumerate(self.config.down_block_types):
+            input_channel = output_channel
+            output_channel = block_out_channels[i]
+            is_final_block = i == len(block_out_channels) - 1
+
+            down_block = DownBlock2D(
+                in_channels=input_channel,
+                out_channels=output_channel,
+                num_layers=self.config.layers_per_block,
+                add_downsample=not is_final_block,
+                dtype=self.dtype,
+            )
+            down_blocks.append(down_block)
+        self.down_blocks = down_blocks
 
         # middle
-        hidden_states = self.mid(hidden_states, temb, deterministic=deterministic)
+        self.mid_block = UNetMidBlock2D(
+            in_channels=block_out_channels[-1], attn_num_head_channels=None, dtype=self.dtype
+        )
 
         # end
-        hidden_states = self.norm_out(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.conv_out(hidden_states)
+        conv_out_channels = 2 * self.config.latent_channels if self.config.double_z else self.config.latent_channels
+        self.conv_norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv_out = nn.Conv(
+            conv_out_channels,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+            dtype=self.dtype,
+        )
 
-        return hidden_states
+    def __call__(self, sample, deterministic: bool = True):
+        # in
+        sample = self.conv_in(sample)
+
+        # downsampling
+        for block in self.down_blocks:
+            sample = block(sample, deterministic=deterministic)
+
+        # middle
+        sample = self.mid_block(sample, deterministic=deterministic)
+
+        # end
+        sample = self.conv_norm_out(sample)
+        sample = nn.swish(sample)
+        sample = self.conv_out(sample)
+
+        return sample
 
 
 class Decoder(nn.Module):
@@ -362,16 +362,11 @@ class Decoder(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.temb_ch = 0
-
-        # compute in_ch_mult, block_in and curr_res at lowest res
-        block_in = self.config.ch * self.config.ch_mult[self.config.num_resolutions - 1]
-        curr_res = self.config.resolution // 2 ** (self.config.num_resolutions - 1)
-        self.z_shape = (1, self.config.z_channels, curr_res, curr_res)
+        block_out_channels = self.config.block_out_channels
 
         # z to block_in
         self.conv_in = nn.Conv(
-            block_in,
+            block_out_channels[-1],
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
@@ -379,130 +374,113 @@ class Decoder(nn.Module):
         )
 
         # middle
-        self.mid = MidBlock(block_in, self.temb_ch, self.config.dropout, dtype=self.dtype)
+        self.mid_block = UNetMidBlock2D(
+            in_channels=block_out_channels[-1], attn_num_head_channels=None, dtype=self.dtype
+        )
 
         # upsampling
-        upsample_blocks = []
-        for i_level in reversed(range(self.config.num_resolutions)):
-            upsample_blocks.append(UpsamplingBlock(self.config, curr_res, block_idx=i_level, dtype=self.dtype))
-            if i_level != 0:
-                curr_res = curr_res * 2
-        self.up = list(reversed(upsample_blocks))  # reverse to get consistent order
+        reversed_block_out_channels = list(reversed(block_out_channels))
+        output_channel = reversed_block_out_channels[0]
+        up_blocks = []
+        for i, _ in enumerate(self.config.up_block_types):
+            prev_output_channel = output_channel
+            output_channel = reversed_block_out_channels[i]
+
+            is_final_block = i == len(block_out_channels) - 1
+
+            up_block = UpBlock2D(
+                in_channels=prev_output_channel,
+                out_channels=output_channel,
+                num_layers=self.config.layers_per_block,
+                add_upsample=not is_final_block,
+                dtype=self.dtype,
+            )
+            up_blocks.append(up_block)
+            prev_output_channel = output_channel
+        self.up_blocks = up_blocks
 
         # end
-        self.norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-6)
         self.conv_out = nn.Conv(
-            self.config.out_ch,
+            self.config.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
 
-    def __call__(self, hidden_states, deterministic: bool = True):
-        # timestep embedding
-        temb = None
-
+    def __call__(self, sample, deterministic: bool = True):
         # z to block_in
-        hidden_states = self.conv_in(hidden_states)
+        sample = self.conv_in(sample)
 
         # middle
-        hidden_states = self.mid(hidden_states, temb, deterministic=deterministic)
+        sample = self.mid(sample, deterministic=deterministic)
 
         # upsampling
         for block in reversed(self.up):
-            hidden_states = block(hidden_states, temb, deterministic=deterministic)
+            sample = block(sample, deterministic=deterministic)
 
-        # end
-        if self.config.give_pre_end:
-            return hidden_states
+        sample = self.conv_norm_out(sample)
+        sample = nn.swish(sample)
+        sample = self.conv_out(sample)
 
-        hidden_states = self.norm_out(hidden_states)
-        hidden_states = nn.swish(hidden_states)
-        hidden_states = self.conv_out(hidden_states)
-
-        return hidden_states
+        return sample
 
 
-class VectorQuantizer(nn.Module):
-    """
-    see https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py
-    ____________________________________________
-    Discretization bottleneck part of the VQ-VAE.
-    Inputs:
-    - n_e : number of embeddings
-    - e_dim : dimension of embedding
-    - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
-    _____________________________________________
-    """
+class DiagonalGaussianDistribution(object):
+    # TODO: should we pass dtype?
+    def __init__(self, parameters, deterministic=False):
+        # Last axis to account for channels-last
+        self.mean, self.logvar = jnp.split(parameters, 2, axis=-1)
+        self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
+        self.deterministic = deterministic
+        self.std = jnp.exp(0.5 * self.logvar)
+        self.var = jnp.exp(self.logvar)
+        if self.deterministic:
+            self.var = self.std = jnp.zeros_like(self.mean)
 
-    config: VAEConfig
-    dtype: jnp.dtype = jnp.float32
+    def sample(self, key):
+        return self.mean + self.std * jax.random.normal(key, self.mean.shape)
 
-    def setup(self):
-        self.embedding = nn.Embed(self.config.n_embed, self.config.embed_dim, dtype=self.dtype)  # TODO: init
+    def kl(self, other=None):
+        if self.deterministic:
+            return jnp.array([0.0])
 
-    def __call__(self, hidden_states):
-        """
-        Inputs the output of the encoder network z and maps it to a discrete
-        one-hot vector that is the index of the closest embedding vector e_j
-        z (continuous) -> z_q (discrete)
-        z.shape = (batch, channel, height, width)
-        quantization pipeline:
-            1. get encoder input (B,C,H,W)
-            2. flatten input to (B*H*W,C)
-        """
-        #  flatten
-        hidden_states_flattended = hidden_states.reshape((-1, self.config.embed_dim))
+        if other is None:
+            return 0.5 * jnp.sum(self.mean**2 + self.var - 1.0 - self.logvar, axis=[1, 2, 3])
 
-        # dummy op to init the weights, so we can access them below
-        self.embedding(jnp.ones((1, 1), dtype="i4"))
-
-        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        emb_weights = self.variables["params"]["embedding"]["embedding"]
-        distance = (
-            jnp.sum(hidden_states_flattended**2, axis=1, keepdims=True)
-            + jnp.sum(emb_weights**2, axis=1)
-            - 2 * jnp.dot(hidden_states_flattended, emb_weights.T)
+        return 0.5 * jnp.sum(
+            jnp.square(self.mean - other.mean) / other.var + self.var / other.var - 1.0 - self.logvar + other.logvar,
+            axis=[1, 2, 3],
         )
 
-        # get quantized latent vectors
-        min_encoding_indices = jnp.argmin(distance, axis=1)
-        z_q = self.embedding(min_encoding_indices).reshape(hidden_states.shape)
+    def nll(self, sample, axis=[1, 2, 3]):
+        if self.deterministic:
+            return jnp.array([0.0])
 
-        # reshape to (batch, num_tokens)
-        min_encoding_indices = min_encoding_indices.reshape(hidden_states.shape[0], -1)
+        logtwopi = jnp.log(2.0 * jnp.pi)
+        return 0.5 * jnp.sum(logtwopi + self.logvar + jnp.square(sample - self.mean) / self.var, axis=axis)
 
-        # compute the codebook_loss (q_loss) outside the model
-        # here we return the embeddings and indices
-        return z_q, min_encoding_indices
-
-    def get_codebook_entry(self, indices, shape=None):
-        # indices are expected to be of shape (batch, num_tokens)
-        # get quantized latent vectors
-        batch, num_tokens = indices.shape
-        z_q = self.embedding(indices)
-        z_q = z_q.reshape(batch, int(math.sqrt(num_tokens)), int(math.sqrt(num_tokens)), -1)
-        return z_q
+    def mode(self):
+        return self.mean
 
 
-class VQModule(nn.Module):
+class AutoencoderKLModule(nn.Module):
     config: VAEConfig
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.encoder = Encoder(self.config, dtype=self.dtype)
         self.decoder = Decoder(self.config, dtype=self.dtype)
-        self.quantize = VectorQuantizer(self.config, dtype=self.dtype)
         self.quant_conv = nn.Conv(
-            self.config.embed_dim,
+            2 * self.config.latent_channels,
             kernel_size=(1, 1),
             strides=(1, 1),
             padding="VALID",
             dtype=self.dtype,
         )
         self.post_quant_conv = nn.Conv(
-            self.config.z_channels,
+            self.config.latent_channels,
             kernel_size=(1, 1),
             strides=(1, 1),
             padding="VALID",
@@ -511,27 +489,27 @@ class VQModule(nn.Module):
 
     def encode(self, pixel_values, deterministic: bool = True):
         hidden_states = self.encoder(pixel_values, deterministic=deterministic)
-        hidden_states = self.quant_conv(hidden_states)
-        quant_states, indices = self.quantize(hidden_states)
-        return quant_states, indices
+        moments = self.quant_conv(hidden_states)
+        posterior = DiagonalGaussianDistribution(moments)
+        return posterior
 
-    def decode(self, hidden_states, deterministic: bool = True):
-        hidden_states = self.post_quant_conv(hidden_states)
+    def decode(self, latents, deterministic: bool = True):
+        hidden_states = self.post_quant_conv(latents)
         hidden_states = self.decoder(hidden_states, deterministic=deterministic)
         return hidden_states
 
-    def decode_code(self, code_b):
-        hidden_states = self.quantize.get_codebook_entry(code_b)
+    def __call__(self, sample, sample_posterior=False, deterministic: bool = True):
+        posterior = self.encode(sample, deterministic=deterministic)
+        if sample_posterior:
+            rng = self.make_rng("gaussian")
+            hidden_states = posterior.sample(rng)
+        else:
+            hidden_states = posterior.mode()
         hidden_states = self.decode(hidden_states)
-        return hidden_states
-
-    def __call__(self, pixel_values, deterministic: bool = True):
-        quant_states, indices = self.encode(pixel_values, deterministic)
-        hidden_states = self.decode(quant_states, deterministic)
-        return hidden_states, indices
+        return hidden_states, posterior
 
 
-class VQGANPreTrainedModel(FlaxPreTrainedModel):
+class AutoencoderKLPreTrainedModel(FlaxPreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface
     for downloading and loading pretrained models.
@@ -604,5 +582,5 @@ class VQGANPreTrainedModel(FlaxPreTrainedModel):
         )
 
 
-class VQModel(VQGANPreTrainedModel):
-    module_class = VQModule
+class AutoencoderKL(AutoencoderKLPreTrainedModel):
+    module_class = AutoencoderKLModule
