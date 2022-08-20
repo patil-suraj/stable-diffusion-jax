@@ -1,8 +1,5 @@
 import math
-from functools import partial
 from typing import Tuple
-
-import numpy as np
 
 import flax.linen as nn
 import jax
@@ -13,31 +10,31 @@ from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from .configuration_unet2d import UNet2DConfig
 
 
-class SinusoidalEmbedding(nn.Module):
+def get_sinusoidal_embeddings(timesteps, embedding_dim):
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = jnp.exp(jnp.arange(half_dim) * -emb)
+    emb = timesteps[:, None] * emb[None, :]
+    emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], -1)
+    return emb
+
+
+class Timesteps(nn.Module):
     dim: int = 32
-
     @nn.compact
-    def __call__(self, inputs):
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim) * -emb)
-        emb = inputs[:, None] * emb[None, :]
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], -1)
-        return emb
-
-
+    def __call__(self, timesteps):
+        return get_sinusoidal_embeddings(timesteps, self.dim)
+       
 class TimestepEmbedding(nn.Module):
-    dim: int = 32
+    time_embed_dim: int = 32
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, inputs):
-        time_dim = self.dim * 4
-
-        se = SinusoidalEmbedding(self.dim)(inputs)
-        x = nn.Dense(time_dim)(se)
-        x = nn.gelu(x)
-        x = nn.Dense(time_dim)(x)
-        return x
+    def __call__(self, temb):
+        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_1")(temb)
+        temb = nn.silu(temb)
+        temb = nn.Dense(self.time_embed_dim, dtype=self.dtype, name="linear_2")(temb)
+        return temb
 
 
 class Upsample(nn.Module):
@@ -73,8 +70,7 @@ class Downsample(nn.Module):
             self.out_channels,
             kernel_size=(3, 3),
             strides=(2, 2),
-            # padding="VALID",
-            padding=((1, 1), (1, 1)),
+            padding=((1, 1), (1, 1)), # padding="VALID",
             dtype=self.dtype,
         )
 
@@ -87,30 +83,29 @@ class Downsample(nn.Module):
 
 class ResnetBlock(nn.Module):
     in_channels: int
-    out_channels = (None,)
-    temb_channels = (512,)
-    dropout = (0.0,)
-    use_nin_shortcut = (None,)
+    out_channels = None
+    dropout = 0.0
+    use_nin_shortcut = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        self.out_channels_ = self.in_channels if self.out_channels is None else self.out_channels
+        out_channels = self.in_channels if self.out_channels is None else self.out_channels
 
         self.norm1 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
         self.conv1 = nn.Conv(
-            self.out_channels_,
+            out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
 
-        self.temb_proj = nn.Dense(self.out_channels_, dtype=self.dtype)
+        self.temb_proj = nn.Dense(out_channels, dtype=self.dtype)
 
         self.norm2 = nn.GroupNorm(num_groups=32, epsilon=1e-6)
         self.dropout = nn.Dropout(self.dropout_prob)
         self.conv2 = nn.Conv(
-            self.out_channels_,
+            out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
@@ -118,13 +113,13 @@ class ResnetBlock(nn.Module):
         )
 
         use_nin_shortcut = (
-            self.in_channels != self.out_channels_ if self.use_nin_shortcut is None else self.use_nin_shortcut
+            self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
         )
 
         self.conv_shortcut = None
         if use_nin_shortcut:
             self.conv_shortcut = nn.Conv(
-                self.out_channels_,
+                out_channels,
                 kernel_size=(1, 1),
                 strides=(1, 1),
                 padding="VALID",
@@ -184,7 +179,7 @@ class Attention(nn.Module):
         tensor = tensor.reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
-    def __call__(self, hidden_states, context=None):
+    def __call__(self, hidden_states, context=None, deterministic=True):
         context = hidden_states if context is None else context
 
         q = self.to_q(hidden_states)
@@ -242,7 +237,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
         self.norm3 = nn.LayerNorm(epsilon=1e-5, dtype=self.dtype)
 
-    def __call__(self, hidden_states, context):
+    def __call__(self, hidden_states, context, deterministic=True):
         # self attention
         residual = hidden_states
         hidden_states = self.attn1(self.norm1(hidden_states))
@@ -318,11 +313,11 @@ class SpatialTransformer(nn.Module):
 class CrossAttnDownBlock2D(nn.Module):
     in_channels: int
     out_channels: int
-    temb_channels: int
     dropout: float = 0.0
     num_layers: int = 1
     attn_num_head_channels: int = 1
     add_downsample = True
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.resnets = []
@@ -334,7 +329,6 @@ class CrossAttnDownBlock2D(nn.Module):
             res_block = ResnetBlock(
                 in_channels=in_channels,
                 out_channels=self.out_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
@@ -352,7 +346,7 @@ class CrossAttnDownBlock2D(nn.Module):
         if self.add_downsample:
             self.downsample = Downsample(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, temb, encoder_hidden_states):
+    def __call__(self, hidden_states, temb, encoder_hidden_states, deterministic=True):
         output_states = ()
 
         for resnet, attn in zip(self.resnets, self.attentions):
@@ -370,10 +364,10 @@ class CrossAttnDownBlock2D(nn.Module):
 class DownBlock2D(nn.Module):
     in_channels: int
     out_channels: int
-    temb_channels: int
     dropout: float = 0.0
     num_layers: int = 1
     add_downsample = True
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.resnets = []
@@ -384,7 +378,6 @@ class DownBlock2D(nn.Module):
             res_block = ResnetBlock(
                 in_channels=in_channels,
                 out_channels=self.out_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
@@ -393,7 +386,7 @@ class DownBlock2D(nn.Module):
         if self.add_downsample:
             self.downsample = Downsample(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, temb):
+    def __call__(self, hidden_states, temb, deterministic=True):
         output_states = ()
 
         for resnet in self.resnets:
@@ -411,12 +404,11 @@ class CrossAttnUpBlock2D(nn.Module):
     in_channels: int
     out_channels: int
     prev_output_channel: int
-    temb_channels: int
     dropout: float = 0.0
     num_layers: int = 1
-    resnet_eps: float = 1e-6
     attn_num_head_channels: int = 1
     add_upsample = True
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.resnets = []
@@ -429,7 +421,6 @@ class CrossAttnUpBlock2D(nn.Module):
             res_block = ResnetBlock(
                 in_channels=resnet_in_channels + res_skip_channels,
                 out_channels=self.out_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
@@ -447,7 +438,7 @@ class CrossAttnUpBlock2D(nn.Module):
         if self.add_upsample:
             self.upsample = Upsample(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, res_hidden_states_tuple, temb, encoder_hidden_states):
+    def __call__(self, hidden_states, res_hidden_states_tuple, temb, encoder_hidden_states, deterministic=True):
 
         for resnet, attn in zip(self.resnets, self.attentions):
             # pop res hidden states
@@ -468,10 +459,10 @@ class UpBlock2D(nn.Module):
     in_channels: int
     out_channels: int
     prev_output_channel: int
-    temb_channels: int
     dropout: float = 0.0
     num_layers: int = 1
     add_upsample = True
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         self.resnets = []
@@ -483,7 +474,6 @@ class UpBlock2D(nn.Module):
             res_block = ResnetBlock(
                 in_channels=resnet_in_channels + res_skip_channels,
                 out_channels=self.out_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
@@ -492,7 +482,7 @@ class UpBlock2D(nn.Module):
         if self.add_upsample:
             self.upsample = Upsample(self.out_channels, dtype=self.dtype)
 
-    def __call__(self, hidden_states, res_hidden_states_tuple, temb):
+    def __call__(self, hidden_states, res_hidden_states_tuple, temb, deterministic=True):
         for resnet in self.resnets:
             # pop res hidden states
             res_hidden_states = res_hidden_states_tuple[-1]
@@ -509,10 +499,10 @@ class UpBlock2D(nn.Module):
 
 class UNetMidBlock2DCrossAttn(nn.Module):
     in_channels: int
-    temb_channels: int
     dropout: float = 0.0
     num_layers: int = 1
     attn_num_head_channels: int = 1
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         # there is always at least one resnet
@@ -520,7 +510,6 @@ class UNetMidBlock2DCrossAttn(nn.Module):
             ResnetBlock(
                 in_channels=self.in_channels,
                 out_channels=self.in_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
@@ -541,13 +530,12 @@ class UNetMidBlock2DCrossAttn(nn.Module):
             res_block = ResnetBlock(
                 in_channels=self.in_channels,
                 out_channels=self.in_channels,
-                temb_channels=self.temb_channels,
                 dropout=self.dropout,
                 dtype=self.dtype,
             )
             self.resnets.append(res_block)
 
-    def __call__(self, hidden_states, temb, encoder_hidden_states):
+    def __call__(self, hidden_states, temb, encoder_hidden_states, deterministic=True):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             hidden_states = attn(hidden_states, encoder_hidden_states)
@@ -576,6 +564,10 @@ class UNet2DModule(nn.Module):
             dtype=self.dtype,
         )
 
+        # time
+        self.time_proj = Timesteps(block_out_channels[0])
+        self.time_embedding = TimestepEmbedding(time_embed_dim, dtype=self.dtype)
+
         # down
         self.down_blocks = []
         output_channel = block_out_channels[0]
@@ -588,9 +580,8 @@ class UNet2DModule(nn.Module):
                 down_block = CrossAttnDownBlock2D(
                     in_channels=input_channel,
                     out_channels=output_channel,
-                    temb_channels=time_embed_dim,
                     dropout=config.dropout,
-                    num_layers=config.num_layers,
+                    num_layers=config.layers_per_block,
                     attn_num_head_channels=config.attention_head_dim,
                     add_downsample=not is_final_block,
                     dtype=self.dtype,
@@ -599,7 +590,6 @@ class UNet2DModule(nn.Module):
                 down_block = DownBlock2D(
                     in_channels=input_channel,
                     out_channels=output_channel,
-                    temb_channels=time_embed_dim,
                     dropout=config.dropout,
                     num_layers=config.layers_per_block,
                     add_downsample=not is_final_block,
@@ -611,7 +601,6 @@ class UNet2DModule(nn.Module):
         # mid
         self.mid_block = UNetMidBlock2DCrossAttn(
             in_channels=block_out_channels[-1],
-            temb_channels=time_embed_dim,
             dropout=config.dropout,
             attn_num_head_channels=config.attention_head_dim,
             dtype=self.dtype,
@@ -633,7 +622,6 @@ class UNet2DModule(nn.Module):
                     in_channels=input_channel,
                     out_channels=output_channel,
                     prev_output_channel=prev_output_channel,
-                    temb_channels=time_embed_dim,
                     num_layers=config.layers_per_block + 1,
                     attn_num_head_channels=config.attention_head_dim,
                     add_upsample=not is_final_block,
@@ -645,7 +633,6 @@ class UNet2DModule(nn.Module):
                     in_channels=input_channel,
                     out_channels=output_channel,
                     prev_output_channel=prev_output_channel,
-                    temb_channels=time_embed_dim,
                     num_layers=config.layers_per_block + 1,
                     add_upsample=not is_final_block,
                     dropout=config.dropout,
@@ -665,16 +652,13 @@ class UNet2DModule(nn.Module):
             dtype=self.dtype,
         )
 
-    def __call__(self, sample, timesteps, encoder_hidden_states):
+    def __call__(self, sample, timesteps, encoder_hidden_states, deterministic=True):
 
         # 1. time
-        timesteps = jnp.reshape(timesteps, (-1, 1, 1, 1))  # TODO: check shapes
-
-        # broadcast to batch dimention
+        # broadcast to batch dimension
         timesteps = jnp.broadcast_to(timesteps, (sample.shape[0],) + timesteps.shape)
-
         t_emb = self.time_proj(timesteps)
-        emb = self.time_embedding(t_emb)
+        t_emb = self.time_embedding(t_emb)
 
         # 2. pre-process
         sample = self.conv_in(sample)
@@ -683,23 +667,23 @@ class UNet2DModule(nn.Module):
         down_block_res_samples = (sample,)
         for down_block in self.down_blocks:
             if isinstance(down_block, CrossAttnDownBlock2D):
-                sample, res_samples = down_block(sample, emb, encoder_hidden_states)
+                sample, res_samples = down_block(sample, t_emb, encoder_hidden_states)
             else:
-                sample, res_samples = down_block(sample, emb)
+                sample, res_samples = down_block(sample, t_emb)
 
             down_block_res_samples += res_samples
 
         # 4. mid
-        sample = self.mid_block(sample, emb, encoder_hidden_states)
+        sample = self.mid_block(sample, t_emb, encoder_hidden_states)
 
         # 5. up
         for up_block in self.up_blocks:
             if isinstance(up_block, CrossAttnUpBlock2D):
                 sample = up_block(
-                    sample, temb=emb, encoder_hidden_states=encoder_hidden_states, res_hidden_states_tuple=res_samples
+                    sample, temb=t_emb, encoder_hidden_states=encoder_hidden_states, res_hidden_states_tuple=res_samples
                 )
             else:
-                sample = up_block(sample, temb=emb, res_hidden_states_tuple=res_samples)
+                sample = up_block(sample, temb=t_emb, res_hidden_states_tuple=res_samples)
 
         # 6. post-process
         sample = self.conv_norm_out(sample)
@@ -710,4 +694,55 @@ class UNet2DModule(nn.Module):
 
 
 class UNet2DPretrainedModel(FlaxPreTrainedModel):
-    pass
+    config_class = UNet2DConfig
+    base_model_prefix = "model"
+    module_class: nn.Module = None
+
+    def __init__(
+        self,
+        config: UNet2DConfig,
+        input_shape: Tuple = (1, 256, 256, 3),
+        seed: int = 0,
+        dtype: jnp.dtype = jnp.float32,
+        _do_init: bool = True,
+        **kwargs,
+    ):
+        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        super().__init__(config,
+            module,
+            input_shape=input_shape,
+            seed=seed,
+            dtype=dtype,
+            _do_init=_do_init
+        )
+
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple) -> FrozenDict:
+        # init input tensors
+        sample = jnp.zeros(input_shape, dtype=jnp.float32)
+        timestpes = jnp.ones((1,), dtype=jnp.int32)
+        encoder_hidden_states = jnp.zeros((1, 1, 768), dtype=jnp.float32) # TODO: don't hardcode
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+
+        return self.module.init(rngs, sample, timestpes, encoder_hidden_states)["params"]
+    
+    def __call__(
+        self,
+        sample,
+        timesteps,
+        encoder_hidden_states,
+        params: dict = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+    ):
+        # Handle any PRNG if needed
+        rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+
+        return self.module.apply(
+            {"params": params or self.params},
+            jnp.array(sample),
+            jnp.array(timesteps, dtype=jnp.int32),
+            encoder_hidden_states,
+            not train,
+            rngs=rngs,
+        )
