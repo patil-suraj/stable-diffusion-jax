@@ -3,6 +3,7 @@ from typing import Tuple
 
 from transformers import PretrainedConfig
 
+
 class UNet2DConfig(PretrainedConfig):
     def __init__(
         self,
@@ -43,5 +44,5 @@ class UNet2DConfig(PretrainedConfig):
         self.norm_num_groups = norm_num_groups
         self.norm_eps = norm_eps
         self.dropout = dropout
-        
+
         super().__init__()

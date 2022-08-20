@@ -1,9 +1,9 @@
 import inspect
+
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 from scheduling_pndm import PNDMScheduler
-
 from transformers import CLIPTokenizer, FlaxCLIPTextModel
 
 
@@ -54,7 +54,7 @@ class FlaxLDMTextToImagePipeline:
             latents = jax.random.normal(
                 prng_seed,
                 shape=(text_input.shape[0], self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
-                dtype=jnp.float32
+                dtype=jnp.float32,
             )
 
             # TODO(Nathan) - make the following work with JAX
@@ -106,6 +106,7 @@ class FlaxLDMTextToImagePipeline:
 
         return {"sample": image}
 
+
 # that's the official CLIP model and tokenizer Stable-diffusion uses
 # see: https://github.com/CompVis/stable-diffusion/blob/ce05de28194041e030ccfc70c635fe3707cdfc30/configs/stable-diffusion/v1-inference.yaml#L70
 # and https://github.com/CompVis/stable-diffusion/blob/ce05de28194041e030ccfc70c635fe3707cdfc30/ldm/modules/encoders/modules.py#L137
@@ -114,10 +115,10 @@ clip_model = FlaxCLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 
 
 class DummyUnet(nn.Module):
-
     @nn.compact
     def __call__(self, latents_input, t, encoder_hidden_states):
         return {"sample": latents_input + 1}
+
 
 unet = DummyUnet()
 scheduler = PNDMScheduler()

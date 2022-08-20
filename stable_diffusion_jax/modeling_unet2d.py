@@ -21,10 +21,12 @@ def get_sinusoidal_embeddings(timesteps, embedding_dim):
 
 class Timesteps(nn.Module):
     dim: int = 32
+
     @nn.compact
     def __call__(self, timesteps):
         return get_sinusoidal_embeddings(timesteps, self.dim)
-       
+
+
 class TimestepEmbedding(nn.Module):
     time_embed_dim: int = 32
     dtype: jnp.dtype = jnp.float32
@@ -70,7 +72,7 @@ class Downsample(nn.Module):
             self.out_channels,
             kernel_size=(3, 3),
             strides=(2, 2),
-            padding=((1, 1), (1, 1)), # padding="VALID",
+            padding=((1, 1), (1, 1)),  # padding="VALID",
             dtype=self.dtype,
         )
 
@@ -112,9 +114,7 @@ class ResnetBlock(nn.Module):
             dtype=self.dtype,
         )
 
-        use_nin_shortcut = (
-            self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
-        )
+        use_nin_shortcut = self.in_channels != out_channels if self.use_nin_shortcut is None else self.use_nin_shortcut
 
         self.conv_shortcut = None
         if use_nin_shortcut:
@@ -680,7 +680,10 @@ class UNet2DModule(nn.Module):
         for up_block in self.up_blocks:
             if isinstance(up_block, CrossAttnUpBlock2D):
                 sample = up_block(
-                    sample, temb=t_emb, encoder_hidden_states=encoder_hidden_states, res_hidden_states_tuple=res_samples
+                    sample,
+                    temb=t_emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    res_hidden_states_tuple=res_samples,
                 )
             else:
                 sample = up_block(sample, temb=t_emb, res_hidden_states_tuple=res_samples)
@@ -708,24 +711,18 @@ class UNet2DPretrainedModel(FlaxPreTrainedModel):
         **kwargs,
     ):
         module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
-            dtype=dtype,
-            _do_init=_do_init
-        )
+        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple) -> FrozenDict:
         # init input tensors
         sample = jnp.zeros(input_shape, dtype=jnp.float32)
         timestpes = jnp.ones((1,), dtype=jnp.int32)
-        encoder_hidden_states = jnp.zeros((1, 1, 768), dtype=jnp.float32) # TODO: don't hardcode
+        encoder_hidden_states = jnp.zeros((1, 1, 768), dtype=jnp.float32)  # TODO: don't hardcode
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
         return self.module.init(rngs, sample, timestpes, encoder_hidden_states)["params"]
-    
+
     def __call__(
         self,
         sample,
