@@ -731,7 +731,7 @@ class UNet2DPretrainedModel(FlaxPreTrainedModel):
     def __init__(
         self,
         config: UNet2DConfig,
-        input_shape: Tuple = (1, 32, 32, 3),
+        input_shape: Tuple = (1, 32, 32, 4),
         seed: int = 0,
         dtype: jnp.dtype = jnp.float32,
         _do_init: bool = True,
@@ -742,9 +742,11 @@ class UNet2DPretrainedModel(FlaxPreTrainedModel):
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple) -> FrozenDict:
         # init input tensors
-        sample = jnp.zeros(input_shape, dtype=jnp.float32)
+        sample_shape = (1, self.config.sample_size, self.config.sample_size, self.config.in_channels)
+        sample = jnp.zeros(sample_shape, dtype=jnp.float32)
         timestpes = jnp.ones((1,), dtype=jnp.int32)
-        encoder_hidden_states = jnp.zeros((1, 1, 768), dtype=jnp.float32)  # TODO: don't hardcode
+        encoder_hidden_states = jnp.zeros((1, 1, self.config.cross_attention_dim), dtype=jnp.float32)
+        
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
