@@ -14,7 +14,9 @@ class UNet2DConfig(PretrainedConfig):
         attention_head_dim=8,
         cross_attention_dim=768,
         dropout=0.1,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         self.sample_size = sample_size
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -26,4 +28,3 @@ class UNet2DConfig(PretrainedConfig):
         self.cross_attention_dim = cross_attention_dim
         self.dropout = dropout
 
-        super().__init__()
