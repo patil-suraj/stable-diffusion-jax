@@ -97,26 +97,30 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
 
     def set_timesteps(self, num_inference_steps, offset=0):
         self.num_inference_steps = num_inference_steps
-        self._timesteps = list(
-            range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
-        )
+        # self._timesteps = list(
+        #     range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
+        # )
+        self._timesteps = jnp.arange(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
         self._offset = offset
-        self._timesteps = [t + self._offset for t in self._timesteps]
+        # self._timesteps = [t + self._offset for t in self._timesteps]
+        self._timesteps = self._timesteps + self._offset
 
         if self.config.skip_prk_steps:
             # for some models like stable diffusion the prk steps can/should be skipped to
             # produce better results. When using PNDM with `self.config.skip_prk_steps` the implementation
             # is based on crowsonkb's PLMS sampler implementation: https://github.com/CompVis/latent-diffusion/pull/51
-            self.prk_timesteps = []
-            self.plms_timesteps = list(reversed(self._timesteps[:-1] + self._timesteps[-2:-1] + self._timesteps[-1:]))
+            self.prk_timesteps = jnp.array([])
+            # self.plms_timesteps = list(reversed(self._timesteps[:-1] + self._timesteps[-2:-1] + self._timesteps[-1:]))
+            self.plms_timesteps = jnp.concatenate((self._timesteps[:-1], self._timesteps[-2:-1], self._timesteps[-1:]))[::-1]
         else:
-            prk_timesteps = jnp.array(self._timesteps[-self.pndm_order :]).repeat(2) + jnp.tile(
+            prk_timesteps = self._timesteps[-self.pndm_order :].repeat(2) + jnp.tile(
                 jnp.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), self.pndm_order
             )
-            self.prk_timesteps = list(reversed(prk_timesteps[:-1].repeat(2)[1:-1]))
-            self.plms_timesteps = list(reversed(self._timesteps[:-3]))
+            self.prk_timesteps = prk_timesteps[:-1].repeat(2)[1:-1][::-1]
+            self.plms_timesteps = self._timesteps[:-3][::-1]
 
-        self.timesteps = self.prk_timesteps + self.plms_timesteps
+        timesteps = jnp.concatenate((self.prk_timesteps, self.plms_timesteps))
+        self.timesteps = jnp.array(timesteps, dtype=jnp.int32)
 
         self.ets = []
         self.counter = 0
@@ -185,7 +189,8 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
                 "for more information."
             )
 
-        prev_timestep = max(timestep - self.config.num_train_timesteps // self.num_inference_steps, 0)
+        prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+        prev_timestep = jnp.where(prev_timestep > 0, prev_timestep, 0)
 
         if self.counter != 1:
             self.ets.append(model_output)
