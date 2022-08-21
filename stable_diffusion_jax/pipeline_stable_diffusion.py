@@ -79,10 +79,8 @@ class StableDiffusionPipeline:
 
         latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
 
-        # TODO wait until vqvae is ready in FLAX and then correct that here
-        # image = self.vqvae.decode(latents, params=inference_state.vae_params)
         # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
-        image = latents
+        image = self.vae.decode(latents, params=inference_state.vae_params)
 
         return image
