@@ -102,13 +102,8 @@ def convert_params(pt_model, fx_model):
     return fx_params
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pt_model_path", type=str, required=True)
-    parser.add_argument("--save_path", type=str, required=True)
-    args = parser.parse_args()
-
-    unet_pt = UNet2DConditionModel.from_pretrained(args.pt_model_path, subfolder="unet")
+def convert_diffusers_to_jax(pt_model_path, save_path):
+    unet_pt = UNet2DConditionModel.from_pretrained(pt_model_path, subfolder="unet")
 
     # create UNet flax config and model
     config = UNet2DConfig(
@@ -127,9 +122,9 @@ if __name__ == "__main__":
     # convert unet pt params to jax
     params = convert_params(unet_pt, unet_fx)
     # save unet
-    unet_fx.save_pretrained(f"{args.save_path}/unet", params=params)
+    unet_fx.save_pretrained(f"{save_path}/unet", params=params)
 
-    vae_pt = Autoencoder.from_pretrained(args.pt_model_path, subfolder="vae")
+    vae_pt = Autoencoder.from_pretrained(pt_model_path, subfolder="vae")
 
     # create AutoEncoder flax config and model
     config = VAEConfig(
@@ -147,4 +142,13 @@ if __name__ == "__main__":
     # convert vae pt params to jax
     params = convert_params(vae_pt, vae_fx)
     # save vae
-    vae_fx.save_pretrained(f"{args.save_path}/vae", params=params)
+    vae_fx.save_pretrained(f"{save_path}/vae", params=params)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pt_model_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, required=True)
+    args = parser.parse_args()
+
+    convert_diffusers_to_jax(args.pt_model_path, args.save_path)
