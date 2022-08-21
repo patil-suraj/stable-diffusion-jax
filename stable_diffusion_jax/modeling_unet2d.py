@@ -308,7 +308,7 @@ class ResnetBlock(nn.Module):
         hidden_states = self.conv1(hidden_states)
 
         temb = self.time_emb_proj(nn.swish(temb))
-        temb = jnp.broadcast_to(temb, (temb.shape[0], 1, 1, temb.shape[-1]))
+        temb = jnp.expand_dims(jnp.expand_dims(temb, 1), 1)
         hidden_states = hidden_states + temb
 
         hidden_states = self.norm2(hidden_states)
