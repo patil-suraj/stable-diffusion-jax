@@ -15,7 +15,7 @@ class InferenceState:
     vae_params: flax.core.FrozenDict
 
 
-class FlaxTextToImagePipeline:
+class StableDiffusionPipeline:
     def __init__(self, vae, text_encoder, tokenizer, unet, scheduler):
         scheduler = scheduler.set_format("np")
         self.vae = vae
