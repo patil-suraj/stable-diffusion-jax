@@ -15,10 +15,10 @@
 # DISCLAIMER: This file is strongly influenced by https://github.com/ermongroup/ddim
 
 import math
-from typing import Union
 
 import numpy as np
-import torch
+import jax.numpy as jnp
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
@@ -43,7 +43,7 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
         t1 = i / num_diffusion_timesteps
         t2 = (i + 1) / num_diffusion_timesteps
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-    return np.array(betas, dtype=np.float32)
+    return jnp.array(betas, dtype=jnp.float32)
 
 
 class PNDMScheduler(SchedulerMixin, ConfigMixin):
@@ -51,17 +51,18 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
     def __init__(
         self,
         num_train_timesteps=1000,
-        beta_start=0.0001,
-        beta_end=0.02,
-        beta_schedule="linear",
-        tensor_format="pt",
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        tensor_format="np",
+        skip_prk_steps=True,
     ):
 
         if beta_schedule == "linear":
-            self.betas = np.linspace(beta_start, beta_end, num_train_timesteps, dtype=np.float32)
+            self.betas = jnp.linspace(beta_start, beta_end, num_train_timesteps, dtype=jnp.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = np.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=np.float32) ** 2
+            self.betas = jnp.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=jnp.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
             self.betas = betas_for_alpha_bar(num_train_timesteps)
@@ -69,9 +70,9 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
 
         self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = np.cumprod(self.alphas, axis=0)
+        self.alphas_cumprod = jnp.cumprod(self.alphas, axis=0)
 
-        self.one = np.array(1.0)
+        self.one = jnp.array(1.0)
 
         # For now we only support F-PNDM, i.e. the runge-kutta method
         # For more information on the algorithm please take a look at the paper: https://arxiv.org/pdf/2202.09778.pdf
@@ -86,7 +87,8 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
 
         # setable values
         self.num_inference_steps = None
-        self._timesteps = np.arange(0, num_train_timesteps)[::-1].copy()
+        self._timesteps = jnp.arange(0, num_train_timesteps)[::-1].copy()
+        self._offset = 0
         self.prk_timesteps = None
         self.plms_timesteps = None
         self.timesteps = None
@@ -94,38 +96,49 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         self.tensor_format = tensor_format
         self.set_format(tensor_format=tensor_format)
 
-    def set_timesteps(self, num_inference_steps):
+    def set_timesteps(self, num_inference_steps, offset=0):
         self.num_inference_steps = num_inference_steps
         self._timesteps = list(
             range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
         )
+        self._offset = offset
+        self._timesteps = [t + self._offset for t in self._timesteps]
 
-        prk_timesteps = np.array(self._timesteps[-self.pndm_order :]).repeat(2) + np.tile(
-            np.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), self.pndm_order
-        )
-        self.prk_timesteps = list(reversed(prk_timesteps[:-1].repeat(2)[1:-1]))
-        self.plms_timesteps = list(reversed(self._timesteps[:-3]))
+        if self.config.skip_prk_steps:
+            # for some models like stable diffusion the prk steps can/should be skipped to
+            # produce better results. When using PNDM with `self.config.skip_prk_steps` the implementation
+            # is based on crowsonkb's PLMS sampler implementation: https://github.com/CompVis/latent-diffusion/pull/51
+            self.prk_timesteps = []
+            self.plms_timesteps = list(reversed(self._timesteps[:-1] + self._timesteps[-2:-1] + self._timesteps[-1:]))
+        else:
+            prk_timesteps = jnp.array(self._timesteps[-self.pndm_order :]).repeat(2) + jnp.tile(
+                jnp.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), self.pndm_order
+            )
+            self.prk_timesteps = list(reversed(prk_timesteps[:-1].repeat(2)[1:-1]))
+            self.plms_timesteps = list(reversed(self._timesteps[:-3]))
+
         self.timesteps = self.prk_timesteps + self.plms_timesteps
 
+        self.ets = []
         self.counter = 0
         self.set_format(tensor_format=self.tensor_format)
 
     def step(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: jnp.ndarray,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
+        sample: jnp.ndarray,
     ):
-        if self.counter < len(self.prk_timesteps):
+        if self.counter < len(self.prk_timesteps) and not self.config.skip_prk_steps:
             return self.step_prk(model_output=model_output, timestep=timestep, sample=sample)
         else:
             return self.step_plms(model_output=model_output, timestep=timestep, sample=sample)
 
     def step_prk(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: jnp.ndarray,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
+        sample: jnp.ndarray,
     ):
         """
         Step function propagating the sample with the Runge-Kutta method. RK takes 4 forward passes to approximate the
@@ -157,15 +170,15 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
 
     def step_plms(
         self,
-        model_output: Union[torch.FloatTensor, np.ndarray],
+        model_output: jnp.ndarray,
         timestep: int,
-        sample: Union[torch.FloatTensor, np.ndarray],
+        sample: jnp.ndarray,
     ):
         """
         Step function propagating the sample with the linear multi-step method. This has one forward pass with multiple
         times to approximate the solution.
         """
-        if len(self.ets) < 3:
+        if not self.config.skip_prk_steps and len(self.ets) < 3:
             raise ValueError(
                 f"{self.__class__} can only be run AFTER scheduler has been run "
                 "in 'prk' mode for at least 12 iterations "
@@ -174,9 +187,26 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             )
 
         prev_timestep = max(timestep - self.config.num_train_timesteps // self.num_inference_steps, 0)
-        self.ets.append(model_output)
 
-        model_output = (1 / 24) * (55 * self.ets[-1] - 59 * self.ets[-2] + 37 * self.ets[-3] - 9 * self.ets[-4])
+        if self.counter != 1:
+            self.ets.append(model_output)
+        else:
+            prev_timestep = timestep
+            timestep = timestep + self.config.num_train_timesteps // self.num_inference_steps
+
+        if len(self.ets) == 1 and self.counter == 0:
+            model_output = model_output
+            self.cur_sample = sample
+        elif len(self.ets) == 1 and self.counter == 1:
+            model_output = (model_output + self.ets[-1]) / 2
+            sample = self.cur_sample
+            self.cur_sample = None
+        elif len(self.ets) == 2:
+            model_output = (3 * self.ets[-1] - self.ets[-2]) / 2
+        elif len(self.ets) == 3:
+            model_output = (23 * self.ets[-1] - 16 * self.ets[-2] + 5 * self.ets[-3]) / 12
+        else:
+            model_output = (1 / 24) * (55 * self.ets[-1] - 59 * self.ets[-2] + 37 * self.ets[-3] - 9 * self.ets[-4])
 
         prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output)
         self.counter += 1
@@ -196,8 +226,8 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # sample -> x_t
         # model_output -> e_θ(x_t, t)
         # prev_sample -> x_(t−δ)
-        alpha_prod_t = self.alphas_cumprod[timestep + 1]
-        alpha_prod_t_prev = self.alphas_cumprod[timestep_prev + 1]
+        alpha_prod_t = self.alphas_cumprod[timestep + 1 - self._offset]
+        alpha_prod_t_prev = self.alphas_cumprod[timestep_prev + 1 - self._offset]
         beta_prod_t = 1 - alpha_prod_t
         beta_prod_t_prev = 1 - alpha_prod_t_prev
 
