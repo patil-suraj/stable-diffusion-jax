@@ -110,6 +110,7 @@ class ResnetBlock(nn.Module):
         hidden_states = self.dropout(hidden_states, deterministic)
         hidden_states = self.conv2(hidden_states)
 
+        # import ipdb; ipdb.set_trace()
         if self.conv_shortcut is not None:
             residual = self.conv_shortcut(residual)
 
@@ -140,7 +141,7 @@ class AttnBlock(nn.Module):
 
     def __call__(self, hidden_states):
         residual = hidden_states
-        batch, height, width, channels = query.shape
+        batch, height, width, channels = hidden_states.shape
 
         hidden_states = self.group_norm(hidden_states)
 
@@ -168,6 +169,7 @@ class AttnBlock(nn.Module):
         hidden_states = hidden_states.reshape(new_hidden_states_shape)
 
         hidden_states = self.proj_attn(hidden_states)
+        hidden_states = hidden_states.reshape((batch, height, width, channels))
         hidden_states = hidden_states + residual
         return hidden_states
 
@@ -219,7 +221,6 @@ class UpBlock2D(nn.Module):
         resnets = []
         for i in range(self.num_layers):
             in_channels = self.in_channels if i == 0 else self.out_channels
-
             res_block = ResnetBlock(
                 in_channels=in_channels,
                 out_channels=self.out_channels,
@@ -391,12 +392,13 @@ class Decoder(nn.Module):
             up_block = UpBlock2D(
                 in_channels=prev_output_channel,
                 out_channels=output_channel,
-                num_layers=self.config.layers_per_block,
+                num_layers=self.config.layers_per_block + 1,
                 add_upsample=not is_final_block,
                 dtype=self.dtype,
             )
             up_blocks.append(up_block)
             prev_output_channel = output_channel
+
         self.up_blocks = up_blocks
 
         # end
@@ -414,10 +416,10 @@ class Decoder(nn.Module):
         sample = self.conv_in(sample)
 
         # middle
-        sample = self.mid(sample, deterministic=deterministic)
+        sample = self.mid_block(sample, deterministic=deterministic)
 
         # upsampling
-        for block in reversed(self.up):
+        for block in self.up_blocks:
             sample = block(sample, deterministic=deterministic)
 
         sample = self.conv_norm_out(sample)
@@ -505,6 +507,7 @@ class AutoencoderKLModule(nn.Module):
             hidden_states = posterior.sample(rng)
         else:
             hidden_states = posterior.mode()
+        # import ipdb; ipdb.set_trace()
         hidden_states = self.decode(hidden_states)
         return hidden_states, posterior
 
