@@ -100,7 +100,9 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # self._timesteps = list(
         #     range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
         # )
-        self._timesteps = jnp.arange(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
+        self._timesteps = jnp.arange(
+            0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps
+        )
         self._offset = offset
         # self._timesteps = [t + self._offset for t in self._timesteps]
         self._timesteps = self._timesteps + self._offset
@@ -111,7 +113,9 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             # is based on crowsonkb's PLMS sampler implementation: https://github.com/CompVis/latent-diffusion/pull/51
             self.prk_timesteps = jnp.array([])
             # self.plms_timesteps = list(reversed(self._timesteps[:-1] + self._timesteps[-2:-1] + self._timesteps[-1:]))
-            self.plms_timesteps = jnp.concatenate((self._timesteps[:-1], self._timesteps[-2:-1], self._timesteps[-1:]))[::-1]
+            self.plms_timesteps = jnp.concatenate(
+                (self._timesteps[:-1], self._timesteps[-2:-1], self._timesteps[-1:])
+            )[::-1]
         else:
             prk_timesteps = self._timesteps[-self.pndm_order :].repeat(2) + jnp.tile(
                 jnp.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), self.pndm_order
