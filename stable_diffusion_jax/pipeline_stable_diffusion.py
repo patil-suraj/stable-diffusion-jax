@@ -43,6 +43,7 @@ class StableDiffusionPipeline:
         inference_state: InferenceState,
         num_inference_steps: int = 50,
         guidance_scale: float = 1.0,
+        debug: bool = False,
     ):
 
         self.scheduler.set_timesteps(num_inference_steps)
@@ -64,7 +65,7 @@ class StableDiffusionPipeline:
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             latents_input = jnp.concatenate([latents] * 2)
-            
+
             t = jnp.array(self.scheduler.timesteps)[step]
             timestep = jnp.broadcast_to(t, latents_input.shape[0])
 
@@ -80,7 +81,12 @@ class StableDiffusionPipeline:
             latents = self.scheduler.step(noise_pred, t, latents)["prev_sample"]
             return latents
 
-        latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
+        if debug:
+            # run with python for loop
+            for i in range(num_inference_steps):
+                latents = loop_body(i, latents)
+        else:
+            latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
 
         # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
