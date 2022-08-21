@@ -51,24 +51,27 @@ class StableDiffusionPipeline:
         uncond_embeddings = self.text_encoder(uncond_input_ids, params=inference_state.text_encoder_params)[0]
         context = jnp.concatenate([uncond_embeddings, text_embeddings])
 
-        latents = jax.random.normal(
-            prng_seed,
-            shape=(input_ids.shape[0], self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
-            dtype=jnp.float32,
+        latents_shape = (
+            input_ids.shape[0],
+            self.unet.config.sample_size,
+            self.unet.config.sample_size,
+            self.unet.config.in_channels,
         )
+        latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
 
         def loop_body(step, latents):
-            t = jnp.array(self.scheduler.timesteps)[step]
-
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             latents_input = jnp.concatenate([latents] * 2)
+            
+            t = jnp.array(self.scheduler.timesteps)[step]
+            timestep = jnp.broadcast_to(t, latents_input.shape[0])
 
             # predict the noise residual
             noise_pred = self.unet(
-                latents_input, t, encoder_hidden_states=context, params=inference_state.unet_params
-            )["sample"]
+                latents_input, timestep, encoder_hidden_states=context, params=inference_state.unet_params
+            )
             # perform guidance
             noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
