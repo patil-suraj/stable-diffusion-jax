@@ -1,10 +1,12 @@
+import argparse
 import re
 
 import jax.numpy as jnp
-import torch
+from diffusers import AutoencoderKL as Autoencoder
+from diffusers import UNet2DConditionModel
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from . import UNet2D, UNet2DConfig
+from . import AutoencoderKL, UNet2D, UNet2DConfig, VAEConfig
 
 regex = r"\w+[.]\d+"
 
@@ -89,20 +91,60 @@ def convert_pytorch_state_dict_to_flax(pt_state_dict, flax_model):
     return unflatten_dict(flax_state_dict)
 
 
-def convert_model(config_path, pt_state_dict_path, save_path):
-    config = UNet2DConfig.from_pretrained(config_path)
-    model = UNet2D(config)
-
-    state_dict = torch.load(pt_state_dict_path, map_location="cpu")["state_dict"]
+def convert_params(pt_model, fx_model):
+    state_dict = pt_model.state_dict()
     keys = list(state_dict.keys())
     for key in keys:
-        if key.startswith("loss"):
-            state_dict.pop(key)
-            continue
         renamed_key = rename_key(key)
         state_dict[renamed_key] = state_dict.pop(key)
 
-    state = convert_pytorch_state_dict_to_flax(state_dict, model)
-    model.params = state
-    model.save_pretrained(save_path)
-    return model
+    fx_params = convert_pytorch_state_dict_to_flax(state_dict, fx_model)
+    return fx_params
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pt_model_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, required=True)
+    args = parser.parse_args()
+
+    unet_pt = UNet2DConditionModel.from_pretrained(args.pt_model_path, subfolder="unet")
+
+    # create UNet flax config and model
+    config = UNet2DConfig(
+        sample_size=unet_pt.config.sample_size,
+        in_channels=unet_pt.config.in_channels,
+        out_channels=unet_pt.config.out_channels,
+        down_block_types=unet_pt.config.down_block_types,
+        up_block_types=unet_pt.config.up_block_types,
+        block_out_channels=unet_pt.config.block_out_channels,
+        layers_per_block=unet_pt.config.layers_per_block,
+        attention_head_dim=unet_pt.config.attention_head_dim,
+        cross_attention_dim=unet_pt.config.cross_attention_dim,
+    )
+    unet_fx = UNet2D(config, _do_init=False)
+
+    # convert unet pt params to jax
+    params = convert_params(unet_pt, unet_fx)
+    # save unet
+    unet_fx.save_pretrained(f"{args.save_path}/unet", params=params)
+
+    vae_pt = Autoencoder.from_pretrained(args.pt_model_path, subfolder="vae")
+
+    # create AutoEncoder flax config and model
+    config = VAEConfig(
+        sample_size=vae_pt.config.sample_size,
+        in_channels=vae_pt.config.in_channels,
+        out_channels=vae_pt.config.out_channels,
+        down_block_types=vae_pt.config.down_block_types,
+        up_block_types=vae_pt.config.up_block_types,
+        block_out_channels=vae_pt.config.block_out_channels,
+        layers_per_block=vae_pt.config.layers_per_block,
+        latent_channels=vae_pt.config.latent_channels,
+    )
+    vae_fx = AutoencoderKL(config, _do_init=False)
+
+    # convert vae pt params to jax
+    params = convert_params(vae_pt, vae_fx)
+    # save vae
+    vae_fx.save_pretrained(f"{args.save_path}/vae", params=params)
