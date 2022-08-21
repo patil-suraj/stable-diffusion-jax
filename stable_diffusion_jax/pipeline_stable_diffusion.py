@@ -1,18 +1,25 @@
-import inspect
-
+import flax
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from PIL import Image
-from scheduling_pndm import PNDMScheduler
 from transformers import CLIPTokenizer, FlaxCLIPTextModel
 
+from stable_diffusion_jax.scheduling_pndm import PNDMScheduler
 
-class FlaxLDMTextToImagePipeline:
-    def __init__(self, vqvae, clip, tokenizer, unet, scheduler):
+
+@flax.struct.dataclass
+class InferenceState:
+    text_encoder_params: flax.core.FrozenDict
+    unet_params: flax.core.FrozenDict
+    vae_params: flax.core.FrozenDict
+
+
+class FlaxTextToImagePipeline:
+    def __init__(self, vae, text_encoder, tokenizer, unet, scheduler):
         scheduler = scheduler.set_format("np")
-        self.vqvae = vqvae
-        self.clip = clip
+        self.vae = vae
+        self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.unet = unet
         self.scheduler = scheduler
@@ -28,100 +35,57 @@ class FlaxLDMTextToImagePipeline:
 
         return pil_images
 
-    def __call__(
+    def sample(
         self,
-        prompt,
-        batch_size=1,
-        prng_seed=None,
-        eta=0.0,
-        guidance_scale=1.0,
-        num_inference_steps=50,
-        output_type="pil",
+        input_ids: jnp.ndarray,
+        uncond_input_ids: jnp.ndarray,
+        prng_seed: jax.random.PRNGKey,
+        inference_state: InferenceState,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 1.0,
     ):
-
-        # eta corresponds to η in paper and should be between [0, 1]
-        batch_size = len(prompt)
-
-        # get unconditional embeddings for classifier free guidance
-        if guidance_scale != 1.0:
-            uncond_input = self.tokenizer([""] * batch_size, padding="max_length", max_length=77, return_tensors="jax")
-        else:
-            uncond_input = None
-
-        # get prompt text embeddings
-        text_input = self.tokenizer(prompt, padding="max_length", max_length=77, return_tensors="jax")
 
         self.scheduler.set_timesteps(num_inference_steps)
 
-        def _forward(
-            self,
-            text_input,
-            uncond_input=None,
-        ):
-            if guidance_scale != 1.0:
-                uncond_embeddings = self.clip(uncond_input.input_ids)[0]
+        text_embeddings = self.text_encoder(input_ids, params=inference_state.text_encoder_params)[0]
+        uncond_embeddings = self.text_encoder(uncond_input_ids, params=inference_state.text_encoder_params)[0]
+        context = jnp.concatenate([uncond_embeddings, text_embeddings])
 
-            text_embeddings = self.clip(text_input.input_ids)[0]
+        latents = jax.random.normal(
+            prng_seed,
+            shape=(input_ids.shape[0], self.unet.in_channels, self.unet.sample_size, self.unet.sample_size),
+            dtype=jnp.float32,
+        )
 
-            latents = jax.random.normal(
-                prng_seed,
-                shape=(
-                    text_input.input_ids.shape[0],
-                    self.unet.in_channels,
-                    self.unet.sample_size,
-                    self.unet.sample_size,
-                ),
-                dtype=jnp.float32,
-            )
+        def loop_body(step, latents):
+            t = jnp.array(self.scheduler.timesteps)[step]
 
-            # TODO(Nathan) - make the following work with JAX
-            # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-            accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
-            extra_kwrags = {}
-            if not accepts_eta:
-                extra_kwrags["eta"] = eta
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            latents_input = jnp.concatenate([latents] * 2)
 
-            for t in self.scheduler.timesteps:
-                if guidance_scale == 1.0:
-                    # guidance_scale of 1 means no guidance
-                    latents_input = latents
-                    context = text_embeddings
-                else:
-                    # For classifier free guidance, we need to do two forward passes.
-                    # Here we concatenate the unconditional and text embeddings into a single batch
-                    # to avoid doing two forward passes
-                    latents_input = jnp.concatenate([latents] * 2)
-                    context = jnp.concatenate([uncond_embeddings, text_embeddings])
+            # predict the noise residual
+            noise_pred = self.unet(
+                latents_input, t, encoder_hidden_states=context, params=inference_state.unet_params
+            )["sample"]
+            # perform guidance
+            noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
-                # predict the noise residual
-                noise_pred = self.unet(latents_input, t, encoder_hidden_states=context)["sample"]
-                # perform guidance
-                if guidance_scale != 1.0:
-                    noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents)["prev_sample"]
+            return latents
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, **extra_kwrags)["prev_sample"]
+        latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
 
-            # TODO wait until vqvae is ready in FLAX and then correct that here
-            # image = self.vqvae.decode(latents)
-            # scale and decode the image latents with vae
-            latents = 1 / 0.18215 * latents
-            image = latents
+        # TODO wait until vqvae is ready in FLAX and then correct that here
+        # image = self.vqvae.decode(latents, params=inference_state.vae_params)
+        # scale and decode the image latents with vae
+        latents = 1 / 0.18215 * latents
+        image = latents
 
-            return image
-
-        # or jax.pmap
-        jit_forward = jax.jit(_forward)
-
-        image = jit_forward(text_input, uncond_input)
-
-        image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).numpy()
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
-
-        return {"sample": image}
+        return image
 
 
 # that's the official CLIP model and tokenizer Stable-diffusion uses
