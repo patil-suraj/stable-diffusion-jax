@@ -159,7 +159,7 @@ class AttnBlock(nn.Module):
         # compute attentions
         scale = 1 / math.sqrt(math.sqrt(self.channels / self.num_heads))
         attn_weights = jnp.einsum("...qc,...kc->...qk", query * scale, key * scale)
-        attn_weights = nn.softmax(attn_weights, axis=2)
+        attn_weights = nn.softmax(attn_weights, axis=-1)
 
         # attend to values
         hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
@@ -571,6 +571,7 @@ class AutoencoderKLPreTrainedModel(FlaxPreTrainedModel):
     def __call__(
         self,
         pixel_values,
+        sample_posterior: bool = False,
         params: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
@@ -581,6 +582,7 @@ class AutoencoderKLPreTrainedModel(FlaxPreTrainedModel):
         return self.module.apply(
             {"params": params or self.params},
             jnp.array(pixel_values),
+            sample_posterior,
             not train,
             rngs=rngs,
         )
