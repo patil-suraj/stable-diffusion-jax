@@ -86,32 +86,3 @@ class StableDiffusionPipeline:
         image = latents
 
         return image
-
-
-# that's the official CLIP model and tokenizer Stable-diffusion uses
-# see: https://github.com/CompVis/stable-diffusion/blob/ce05de28194041e030ccfc70c635fe3707cdfc30/configs/stable-diffusion/v1-inference.yaml#L70
-# and https://github.com/CompVis/stable-diffusion/blob/ce05de28194041e030ccfc70c635fe3707cdfc30/ldm/modules/encoders/modules.py#L137
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-clip_model = FlaxCLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-
-
-class DummyUnet(nn.Module):
-    in_channels = 3
-    sample_size = 1
-
-    @nn.compact
-    def __call__(self, latents_input, t, encoder_hidden_states):
-        return {"sample": latents_input + 1}
-
-
-unet = DummyUnet()
-scheduler = PNDMScheduler()
-
-
-pipeline = FlaxLDMTextToImagePipeline(vqvae=None, clip=clip_model, tokenizer=tokenizer, unet=unet, scheduler=scheduler)
-
-# now running the pipeline should work more or less which it doesn't at the moment @Nathan
-key = jax.random.PRNGKey(0)
-
-prompt = "A painting of a squirrel eating a burger"
-images = pipeline([prompt], prng_seed=key, num_inference_steps=50, eta=0.3, guidance_scale=6)["sample"]
