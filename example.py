@@ -21,6 +21,9 @@ scheduler = PNDMScheduler()
 
 
 state = InferenceState(text_encoder_params=clip_params, unet_params=unet_params, vae_params=vae_params)
+# for single GPU 
+state = jax.tree_map(lambda arr: jax.device_put(arr, jax.devices()[0]), state)
+
 
 pipe = StableDiffusionPipeline(text_encoder=clip_model, tokenizer=tokenizer, unet=unet, scheduler=scheduler, vae=vae)
 
