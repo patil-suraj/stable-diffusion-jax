@@ -1,4 +1,7 @@
 import jax
+import numpy as np
+
+from PIL import Image
 
 from transformers import FlaxCLIPTextModel, CLIPTokenizer
 
@@ -32,10 +35,16 @@ input_ids = tokenizer(p, padding="max_length", truncation=True, max_length=77, r
 uncond_input_ids = tokenizer([""], padding="max_length", truncation=True, max_length=77, return_tensors="jax").input_ids
 rng = jax.random.PRNGKey(42)
 
-image = pipe.sample(
-    input_ids, uncond_input_ids, prng_seed=rng, inference_state=state, guidance_scale=7.5, num_inference_steps=50
-)
+
+# image = pipe.sample(
+#     input_ids, uncond_input_ids, prng_seed=rng, inference_state=state, guidance_scale=7.5, num_inference_steps=50
+# )
 
 # with jit
 sample = jax.jit(pipe.sample, static_argnums=4)
-image = sample(input_ids, uncond_input_ids, prng_seed=rng, inference_state=state, guidance_scale=7.5, num_inference_steps=50)
+images = sample(input_ids, uncond_input_ids, prng_seed=rng, inference_state=state, guidance_scale=7.5, num_inference_steps=50)
+
+images = np.asarray((images / 2 + 0.5))
+images = np.clip(images, 0, 1)
+images = (images * 255).round().astype("uint8")
+pil_images = [Image.fromarray(image) for image in images]
