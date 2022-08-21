@@ -103,7 +103,7 @@ def convert_params(pt_model, fx_model):
 
 
 def convert_diffusers_to_jax(pt_model_path, save_path):
-    unet_pt = UNet2DConditionModel.from_pretrained(pt_model_path, subfolder="unet")
+    unet_pt = UNet2DConditionModel.from_pretrained(pt_model_path, subfolder="unet", use_auth_token=True)
 
     # create UNet flax config and model
     config = UNet2DConfig(
@@ -124,7 +124,7 @@ def convert_diffusers_to_jax(pt_model_path, save_path):
     # save unet
     unet_fx.save_pretrained(f"{save_path}/unet", params=params)
 
-    vae_pt = Autoencoder.from_pretrained(pt_model_path, subfolder="vae")
+    vae_pt = Autoencoder.from_pretrained(pt_model_path, subfolder="vae", use_auth_token=True)
 
     # create AutoEncoder flax config and model
     config = VAEConfig(
