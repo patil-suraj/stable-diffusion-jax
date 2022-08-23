@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import jax
 from typing import Optional, Tuple
 import optax
+import warnings
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 
@@ -32,12 +33,15 @@ class StableDiffusionSafetyCheckerModule(nn.Module):
         self.concept_embeds_weights = self.param("concept_embeds_weights", jax.nn.initializers.ones, (17,))
         self.special_care_embeds_weights = self.param("special_care_embeds_weights", jax.nn.initializers.ones, (3,))
 
-    def __call__(self, clip_input):
+    def __call__(self, clip_input, images=None):
         pooled_output = self.vision_model(clip_input)[1]  # pooled_output
         image_embeds = self.visual_projection(pooled_output)
 
         special_cos_dist = cosine_distance(image_embeds, self.special_care_embeds)
         cos_dist = cosine_distance(image_embeds, self.concept_embeds)
+
+        if images is None:
+            return special_cos_dist, cos_dist
 
         special_cos_dist = np.asarray(special_cos_dist)
         cos_dist = np.asarray(cos_dist)
@@ -68,11 +72,24 @@ class StableDiffusionSafetyCheckerModule(nn.Module):
 
             result.append(result_img)
 
-        return result
+        has_nsfw_concepts = [len(res["bad_concepts"]) > 0 for res in result]
 
-#        has_nsfw_concepts = [len(res["bad_concepts"]) > 0 for res in result]
-#
-#        return has_nsfw_concepts
+        images_was_copied = False
+        for idx, has_nsfw_concept in enumerate(has_nsfw_concepts):
+            if has_nsfw_concept:
+                if not images_was_copied:
+                    images_was_copied = True
+                    images = images.copy()
+
+                images[idx] = np.zeros(images[idx].shape)  # black image
+
+            if any(has_nsfw_concepts):
+                warnings.warn(
+                    "Potential NSFW content was detected in one or more images. A black image will be returned instead."
+                    " Try again with a different prompt and/or seed."
+                )
+
+        return images, has_nsfw_concepts
 
 
 class StableDiffusionSafetyCheckerModel(FlaxPreTrainedModel):
@@ -110,11 +127,13 @@ class StableDiffusionSafetyCheckerModel(FlaxPreTrainedModel):
         self,
         pixel_values,
         params: dict = None,
+        images=None,
     ):
         pixel_values = jnp.transpose(pixel_values, (0, 2, 3, 1))
 
         return self.module.apply(
             {"params": params or self.params},
             jnp.array(pixel_values, dtype=jnp.float32),
+            images,
             rngs={},
         )
