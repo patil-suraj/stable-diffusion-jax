@@ -4,24 +4,50 @@ import numpy as np
 from flax.jax_utils import replicate
 from flax.training.common_utils import shard
 from PIL import Image
-from transformers import CLIPTokenizer, FlaxCLIPTextModel, CLIPConfig
+from flax.traverse_util import flatten_dict, unflatten_dict
+import warnings
+import torch
+from transformers import CLIPTokenizer, FlaxCLIPTextModel, CLIPConfig, CLIPFeatureExtractor
+from transformers.modeling_flax_pytorch_utils import convert_pytorch_state_dict_to_flax
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import StableDiffusionSafetyChecker
 
 from stable_diffusion_jax import (
     AutoencoderKL,
     InferenceState,
     PNDMScheduler,
     StableDiffusionPipeline,
-    UNet2D
+    UNet2D,
     StableDiffusionSafetyCheckerModel,
 )
 from stable_diffusion_jax.convert_diffusers_to_jax import convert_diffusers_to_jax
 
+feature_extractor = CLIPFeatureExtractor.from_pretrained("openai/clip-vit-large-patch14")
 
-# convert diffusers checkpoint to jax
-pt_path = "path_to_diffusers_pt_ckpt"
-fx_path = "save_path"
-convert_diffusers_to_jax(pt_path, fx_path)
+shape = (2, 224, 224, 3)
+images = np.random.rand(*shape)
+images = (images * 255).round().astype("uint8")
+pil_images = [Image.fromarray(image) for image in images]
+safety_checker_input_np = feature_extractor(pil_images, return_tensors="np").pixel_values
+safety_checker_input_pt = feature_extractor(pil_images, return_tensors="pt").pixel_values
 
+
+model = StableDiffusionSafetyCheckerModel.from_pretrained("/home/patrick/sd-v1-4-flax/safety_checker")
+pt_model = StableDiffusionSafetyChecker.from_pretrained("/home/patrick/stable-diffusion-v1-1/safety_checker")
+
+result = model(safety_checker_input_np)
+has_nsfw_concepts = [len(res["bad_concepts"]) > 0 for res in result]
+for idx, has_nsfw_concept in enumerate(has_nsfw_concepts):
+    if has_nsfw_concept:
+        images[idx] = np.zeros(images[idx].shape)  # black image
+
+    if any(has_nsfw_concepts):
+        warnings.warn(
+            "Potential NSFW content was detected in one or more images. A black image will be returned instead."
+            " Try again with a different prompt and/or seed."
+        )
+
+
+import ipdb; ipdb.set_trace()
 
 # inference with jax
 dtype = jnp.bfloat16
@@ -30,11 +56,12 @@ clip_model, clip_params = FlaxCLIPTextModel.from_pretrained(
 )
 unet, unet_params = UNet2D.from_pretrained(f"{fx_path}/unet", _do_init=False, dtype=dtype)
 vae, vae_params = AutoencoderKL.from_pretrained(f"{fx_path}/vae", _do_init=False, dtype=dtype)
-safety_model, safety_model_params = StableDiffusionSafetyCheckerModel.from_pretrained(f"{fx_path}/safety_model", _do_init=False, dtype=dtype)
 
-config = CLIPConfig.from_pretrained("openai/clip-vit-large-patch14")
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+
 scheduler = PNDMScheduler()
+
+
 
 # create inference state and replicate it across all TPU devices
 inference_state = InferenceState(text_encoder_params=clip_params, unet_params=unet_params, vae_params=vae_params)
@@ -62,6 +89,7 @@ prng_seed = jax.random.PRNGKey(42)
 input_ids = shard(input_ids)
 uncond_input_ids = shard(uncond_input_ids)
 prng_seed = jax.random.split(prng_seed, 8)
+
 
 # pmap the sample function
 num_inference_steps = 50
