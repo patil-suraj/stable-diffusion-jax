@@ -46,7 +46,7 @@ class StableDiffusionPipeline:
         debug: bool = False,
     ):
 
-        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler.set_timesteps(num_inference_steps, offset=1)
 
         text_embeddings = self.text_encoder(input_ids, params=inference_state.text_encoder_params)[0]
         uncond_embeddings = self.text_encoder(uncond_input_ids, params=inference_state.text_encoder_params)[0]
