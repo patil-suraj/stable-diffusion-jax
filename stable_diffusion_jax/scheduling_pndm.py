@@ -14,13 +14,15 @@
 
 # DISCLAIMER: This file is strongly influenced by https://github.com/ermongroup/ddim
 
+from dataclasses import dataclass
 import math
 
+import jax
 import jax.numpy as jnp
-import numpy as np
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 
+from typing import Tuple
 
 def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
     """
@@ -45,6 +47,63 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
     return jnp.array(betas, dtype=jnp.float32)
 
 
+@dataclass
+class PNDMSchedulerState:
+    betas: jnp.array
+    num_train_timesteps: int
+
+    num_inference_steps = None
+    _timesteps = None   #jnp.arange(0, num_train_timesteps)[::-1].copy()
+    _offset = 0
+    prk_timesteps = None
+    plms_timesteps = None
+    timesteps = None
+    
+    # For now we only support F-PNDM, i.e. the runge-kutta method
+    # For more information on the algorithm please take a look at the paper: https://arxiv.org/pdf/2202.09778.pdf
+    # mainly at formula (9), (12), (13) and the Algorithm 2.
+    pndm_order = 4
+
+    # running values
+    model_output = jnp.array([])
+    counter = 0
+    sample = jnp.array([])
+    ets = jnp.array([])
+
+    @property
+    def alphas(self) -> jnp.array:
+        return 1.0 - self.betas
+
+    @property
+    def alphas_cumprod(self) -> jnp.array:
+        return jnp.cumprod(self.alphas, axis=0)
+
+    @property
+    def state_dict(self) -> dict:
+        return {
+            "betas": self.betas,
+            "num_train_timesteps": self.num_train_timesteps,
+            "num_inference_steps": self.num_inference_steps,
+            "_timesteps": self._timesteps,
+            "_offset": self._offset,
+            "prk_timesteps": self.prk_timesteps,
+            "plms_timesteps": self.plms_timesteps,
+            "timesteps": self.timesteps,
+            "model_output": self.model_output,
+            "counter": self.counter,
+            "sample": self.sample,
+            "ets": self.ets,
+        }
+
+    @classmethod
+    def from_state_dict(cls, dict):
+        # TODO: verify keys
+        state = cls(betas=dict.get("betas"), num_train_timesteps=dict.get("num_train_timesteps"))
+        for k, v in dict.items():
+            state.__setattr__(k, v)
+        return state
+
+    
 class PNDMScheduler(SchedulerMixin, ConfigMixin):
     @register_to_config
     def __init__(
@@ -58,125 +117,123 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
     ):
 
         if beta_schedule == "linear":
-            self.betas = jnp.linspace(beta_start, beta_end, num_train_timesteps, dtype=jnp.float32)
+            betas = jnp.linspace(beta_start, beta_end, num_train_timesteps, dtype=jnp.float32)
         elif beta_schedule == "scaled_linear":
             # this schedule is very specific to the latent diffusion model.
-            self.betas = jnp.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=jnp.float32) ** 2
+            betas = jnp.linspace(beta_start**0.5, beta_end**0.5, num_train_timesteps, dtype=jnp.float32) ** 2
         elif beta_schedule == "squaredcos_cap_v2":
             # Glide cosine schedule
-            self.betas = betas_for_alpha_bar(num_train_timesteps)
+            betas = betas_for_alpha_bar(num_train_timesteps)
         else:
             raise NotImplementedError(f"{beta_schedule} does is not implemented for {self.__class__}")
 
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = jnp.cumprod(self.alphas, axis=0)
-
-        self.one = jnp.array(1.0)
-
-        # For now we only support F-PNDM, i.e. the runge-kutta method
-        # For more information on the algorithm please take a look at the paper: https://arxiv.org/pdf/2202.09778.pdf
-        # mainly at formula (9), (12), (13) and the Algorithm 2.
-        self.pndm_order = 4
-
-        # running values
-        self.cur_model_output = 0
-        self.counter = 0
-        self.cur_sample = None
-        self.ets = []
-
-        # setable values
-        self.num_inference_steps = None
-        self._timesteps = jnp.arange(0, num_train_timesteps)[::-1].copy()
-        self._offset = 0
-        self.prk_timesteps = None
-        self.plms_timesteps = None
-        self.timesteps = None
+        # Temporarily stored here, should be returned
+        self.state = PNDMSchedulerState(betas, num_train_timesteps)
 
         self.tensor_format = tensor_format
         self.set_format(tensor_format=tensor_format)
 
-    def set_timesteps(self, num_inference_steps, offset=0):
-        self.num_inference_steps = num_inference_steps
+    def set_timesteps(
+        self,
+        state: PNDMSchedulerState,
+        shape: Tuple,
+        num_inference_steps: int,
+        offset=0,
+    ) -> PNDMSchedulerState:
+        state.num_inference_steps = num_inference_steps
         # self._timesteps = list(
         #     range(0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps)
         # )
-        self._timesteps = jnp.arange(
+        state._timesteps = jnp.arange(
             0, self.config.num_train_timesteps, self.config.num_train_timesteps // num_inference_steps
         )
-        self._offset = offset
+        state._offset = offset
         # self._timesteps = [t + self._offset for t in self._timesteps]
-        self._timesteps = self._timesteps + self._offset
+        state._timesteps = state._timesteps + state._offset
 
         if self.config.skip_prk_steps:
             # for some models like stable diffusion the prk steps can/should be skipped to
             # produce better results. When using PNDM with `self.config.skip_prk_steps` the implementation
             # is based on crowsonkb's PLMS sampler implementation: https://github.com/CompVis/latent-diffusion/pull/51
-            self.prk_timesteps = jnp.array([])
+            state.prk_timesteps = jnp.array([])
             # self.plms_timesteps = list(reversed(self._timesteps[:-1] + self._timesteps[-2:-1] + self._timesteps[-1:]))
-            self.plms_timesteps = jnp.concatenate(
-                (self._timesteps[:-1], self._timesteps[-2:-1], self._timesteps[-1:])
+            state.plms_timesteps = jnp.concatenate(
+                (state._timesteps[:-1], state._timesteps[-2:-1], state._timesteps[-1:])
             )[::-1]
         else:
-            prk_timesteps = self._timesteps[-self.pndm_order :].repeat(2) + jnp.tile(
-                jnp.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), self.pndm_order
+            prk_timesteps = state._timesteps[-state.pndm_order :].repeat(2) + jnp.tile(
+                jnp.array([0, self.config.num_train_timesteps // num_inference_steps // 2]), state.pndm_order
             )
-            self.prk_timesteps = prk_timesteps[:-1].repeat(2)[1:-1][::-1]
-            self.plms_timesteps = self._timesteps[:-3][::-1]
+            state.prk_timesteps = prk_timesteps[:-1].repeat(2)[1:-1][::-1]
+            state.plms_timesteps = state._timesteps[:-3][::-1]
 
-        timesteps = jnp.concatenate((self.prk_timesteps, self.plms_timesteps))
-        self.timesteps = jnp.array(timesteps, dtype=jnp.int32)
+        timesteps = jnp.concatenate((state.prk_timesteps, state.plms_timesteps))
+        state.timesteps = jnp.array(timesteps, dtype=jnp.int32)
 
-        self.ets = []
-        self.counter = 0
+        # Will be zeros, not really empty
+        state.ets = jnp.empty((3,) + shape)
+        state.sample = jnp.empty(shape)
+        state.model_output = jnp.empty(shape)
+        state.counter = 0
         self.set_format(tensor_format=self.tensor_format)
+
+        return state
 
     def step(
         self,
+        state_dict: dict,
         model_output: jnp.ndarray,
         timestep: int,
         sample: jnp.ndarray,
     ):
-        if self.counter < len(self.prk_timesteps) and not self.config.skip_prk_steps:
-            return self.step_prk(model_output=model_output, timestep=timestep, sample=sample)
-        else:
-            return self.step_plms(model_output=model_output, timestep=timestep, sample=sample)
+        return self.step_plms(state_dict=state_dict, model_output=model_output, timestep=timestep, sample=sample)
+        # if self.config.skip_prk_steps:
+        #     return self.step_plms(state_dict=state_dict, model_output=model_output, timestep=timestep, sample=sample)
+        
+        # return jnp.where(
+        #     state.counter < len(state.prk_timesteps),
+        #     self.step_prk(state_dict=state_dict, model_output=model_output, timestep=timestep, sample=sample),
+        #     self.step_plms(state_dict=state_dict, model_output=model_output, timestep=timestep, sample=sample)
+        # )
 
-    def step_prk(
-        self,
-        model_output: jnp.ndarray,
-        timestep: int,
-        sample: jnp.ndarray,
-    ):
-        """
-        Step function propagating the sample with the Runge-Kutta method. RK takes 4 forward passes to approximate the
-        solution to the differential equation.
-        """
-        diff_to_prev = 0 if self.counter % 2 else self.config.num_train_timesteps // self.num_inference_steps // 2
-        prev_timestep = max(timestep - diff_to_prev, self.prk_timesteps[-1])
-        timestep = self.prk_timesteps[self.counter // 4 * 4]
+    # def step_prk(
+    #     self,
+    #     state_dict: PNDMSchedulerState,
+    #     model_output: jnp.ndarray,
+    #     timestep: int,
+    #     sample: jnp.ndarray,
+    # ):
+    #     """
+    #     Step function propagating the sample with the Runge-Kutta method. RK takes 4 forward passes to approximate the
+    #     solution to the differential equation.
+    #     """
+    #     diff_to_prev = 0 if state.counter % 2 else self.config.num_train_timesteps // state.num_inference_steps // 2
+    #     prev_timestep = max(timestep - diff_to_prev, state.prk_timesteps[-1])
+    #     timestep = state.prk_timesteps[state.counter // 4 * 4]
 
-        if self.counter % 4 == 0:
-            self.cur_model_output += 1 / 6 * model_output
-            self.ets.append(model_output)
-            self.cur_sample = sample
-        elif (self.counter - 1) % 4 == 0:
-            self.cur_model_output += 1 / 3 * model_output
-        elif (self.counter - 2) % 4 == 0:
-            self.cur_model_output += 1 / 3 * model_output
-        elif (self.counter - 3) % 4 == 0:
-            model_output = self.cur_model_output + 1 / 6 * model_output
-            self.cur_model_output = 0
+    #     if state.counter % 4 == 0:
+    #         state.cur_model_output += 1 / 6 * model_output
+    #         state.ets.append(model_output)
+    #         state.cur_sample = sample
+    #     elif (state.counter - 1) % 4 == 0:
+    #         state.cur_model_output += 1 / 3 * model_output
+    #     elif (state.counter - 2) % 4 == 0:
+    #         state.cur_model_output += 1 / 3 * model_output
+    #     elif (state.counter - 3) % 4 == 0:
+    #         model_output = state.cur_model_output + 1 / 6 * model_output
+    #         state.cur_model_output = 0
 
-        # cur_sample should not be `None`
-        cur_sample = self.cur_sample if self.cur_sample is not None else sample
+    #     # cur_sample should not be `None`
+    #     cur_sample = state.cur_sample if state.cur_sample is not None else sample
 
-        prev_sample = self._get_prev_sample(cur_sample, timestep, prev_timestep, model_output)
-        self.counter += 1
+    #     prev_sample = self._get_prev_sample(state, cur_sample, timestep, prev_timestep, model_output)
+    #     state.counter += 1
 
-        return {"prev_sample": prev_sample}
+    #     return {"prev_sample": prev_sample}
 
     def step_plms(
         self,
+        state_dict: dict,
         model_output: jnp.ndarray,
         timestep: int,
         sample: jnp.ndarray,
@@ -185,7 +242,8 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         Step function propagating the sample with the linear multi-step method. This has one forward pass with multiple
         times to approximate the solution.
         """
-        if not self.config.skip_prk_steps and len(self.ets) < 3:
+        state = PNDMSchedulerState.from_state_dict(state_dict)
+        if not self.config.skip_prk_steps and len(state.ets) < 3:
             raise ValueError(
                 f"{self.__class__} can only be run AFTER scheduler has been run "
                 "in 'prk' mode for at least 12 iterations "
@@ -193,35 +251,115 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
                 "for more information."
             )
 
-        prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
+        prev_timestep = timestep - self.config.num_train_timesteps // state.num_inference_steps
         prev_timestep = jnp.where(prev_timestep > 0, prev_timestep, 0)
 
-        if self.counter != 1:
-            self.ets.append(model_output)
-        else:
-            prev_timestep = timestep
-            timestep = timestep + self.config.num_train_timesteps // self.num_inference_steps
+        # if state.counter != 1:
+        #     state.ets.append(model_output)
+        # else:
+        #     prev_timestep = timestep
+        #     timestep = timestep + self.config.num_train_timesteps // state.num_inference_steps
+        prev_timestep = jnp.where(state.counter == 1, timestep, prev_timestep)
+        timestep = jnp.where(state.counter == 1, timestep + self.config.num_train_timesteps // state.num_inference_steps, timestep)
+        
+        # state_dict["ets"] = jnp.where(
+        #     state.counter == 1,
+        #     state.ets,
+        #     jnp.where(state.counter == 0, model_output, jnp.concatenate((state.ets, model_output)))
+        # )
 
-        if len(self.ets) == 1 and self.counter == 0:
-            model_output = model_output
-            self.cur_sample = sample
-        elif len(self.ets) == 1 and self.counter == 1:
-            model_output = (model_output + self.ets[-1]) / 2
-            sample = self.cur_sample
-            self.cur_sample = None
-        elif len(self.ets) == 2:
-            model_output = (3 * self.ets[-1] - self.ets[-2]) / 2
-        elif len(self.ets) == 3:
-            model_output = (23 * self.ets[-1] - 16 * self.ets[-2] + 5 * self.ets[-3]) / 12
-        else:
-            model_output = (1 / 24) * (55 * self.ets[-1] - 59 * self.ets[-2] + 37 * self.ets[-3] - 9 * self.ets[-4])
+        ets = state_dict["ets"]
 
-        prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output)
-        self.counter += 1
+        ets = ets.at[3].set(jnp.where(
+            state.counter >= 4,
+            model_output,
+            state_dict["ets"][3]
+        ))
+        ets = ets.at[2].set(jnp.where(
+            state.counter >= 3,
+            model_output,
+            state_dict["ets"][3]
+        ))
+        ets = ets.at[1].set(jnp.where(
+            state.counter >= 2,
+            model_output,
+            state_dict["ets"][2]
+        ))
+        ets = ets.at[0].set(jnp.where(
+            state.counter > 1,
+            state_dict["ets"][1],
+            state_dict["ets"][0]
+        ))
+        ets = ets.at[0].set(jnp.where(
+            state.counter == 0,
+            model_output,
+            state_dict["ets"][0]
+        ))
+        state_dict["ets"] = ets
 
-        return {"prev_sample": prev_sample}
+        # if len(state.ets) == 1 and state.counter == 0:
+        #     model_output = model_output
+        #     state.cur_sample = sample
+        # elif len(state.ets) == 1 and state.counter == 1:
+        #     model_output = (model_output + state.ets[-1]) / 2
+        #     sample = state.cur_sample
+        #     state.cur_sample = None
+        # elif len(state.ets) == 2:
+        #     model_output = (3 * state.ets[-1] - state.ets[-2]) / 2
+        # elif len(state.ets) == 3:
+        #     model_output = (23 * state.ets[-1] - 16 * state.ets[-2] + 5 * state.ets[-3]) / 12
+        # else:
+        #     model_output = (1 / 24) * (55 * state.ets[-1] - 59 * state.ets[-2] + 37 * state.ets[-3] - 9 * state.ets[-4])
 
-    def _get_prev_sample(self, sample, timestep, timestep_prev, model_output):
+        def counter_0(state_dict):
+            state_dict["sample"] = sample
+            state_dict["model_output"] = model_output
+            return state_dict
+
+        def counter_1(state_dict):
+            state_dict["model_output"] = (model_output + state_dict["ets"][0]) / 2
+            return state_dict
+
+        def counter_2(state_dict):
+            ets = state_dict["ets"]
+            state_dict["model_output"] = (3 * ets[1] - ets[0]) / 2
+            state_dict["sample"] = sample
+            return state_dict
+
+        def counter_3(state_dict):
+            ets = state_dict["ets"]
+            state_dict["model_output"] = (23 * ets[2] - 16 * ets[1] + 5 * ets[0]) / 12
+            state_dict["sample"] = sample
+            return state_dict
+
+        def counter_other(state_dict):
+            ets = state_dict["ets"]
+            state_dict["model_output"] = (1 / 24) * (55 * ets[3] - 59 * ets[2] + 37 * ets[1] - 9 * ets[0])
+            state_dict["sample"] = sample
+            return state_dict
+
+        counter = jnp.clip(state.counter, 0, 4)
+        state_dict = jax.lax.switch(
+            counter,
+            [counter_0, counter_1, counter_2, counter_3, counter_other],
+            state_dict,
+        )
+
+        sample = state_dict["sample"]
+        model_output = state_dict["model_output"]
+        prev_sample = self._get_prev_sample(state_dict, sample, timestep, prev_timestep, model_output)
+        state_dict["counter"] += 1
+
+        return {"prev_sample": prev_sample}, state_dict
+
+    def _get_prev_sample(
+        self,
+        state_dict: dict,
+        sample,
+        timestep,
+        timestep_prev,
+        model_output
+    ):
         # See formula (9) of PNDM paper https://arxiv.org/pdf/2202.09778.pdf
         # this function computes x_(t−δ) using the formula of (9)
         # Note that x_t needs to be added to both sides of the equation
@@ -234,8 +372,9 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         # sample -> x_t
         # model_output -> e_θ(x_t, t)
         # prev_sample -> x_(t−δ)
-        alpha_prod_t = self.alphas_cumprod[timestep + 1 - self._offset]
-        alpha_prod_t_prev = self.alphas_cumprod[timestep_prev + 1 - self._offset]
+        state = PNDMSchedulerState.from_state_dict(state_dict)
+        alpha_prod_t = state.alphas_cumprod[timestep + 1 - state._offset]
+        alpha_prod_t_prev = state.alphas_cumprod[timestep_prev + 1 - state._offset]
         beta_prod_t = 1 - alpha_prod_t
         beta_prod_t_prev = 1 - alpha_prod_t_prev
 
