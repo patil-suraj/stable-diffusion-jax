@@ -171,7 +171,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         state.timesteps = jnp.array(timesteps, dtype=jnp.int32)
 
         # Will be zeros, not really empty
-        state.ets = jnp.empty((3,) + shape)
+        state.ets = jnp.empty((4,) + shape)
         state.sample = jnp.empty(shape)
         state.model_output = jnp.empty(shape)
         state.counter = 0
@@ -261,41 +261,6 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         #     timestep = timestep + self.config.num_train_timesteps // state.num_inference_steps
         prev_timestep = jnp.where(state.counter == 1, timestep, prev_timestep)
         timestep = jnp.where(state.counter == 1, timestep + self.config.num_train_timesteps // state.num_inference_steps, timestep)
-        
-        # state_dict["ets"] = jnp.where(
-        #     state.counter == 1,
-        #     state.ets,
-        #     jnp.where(state.counter == 0, model_output, jnp.concatenate((state.ets, model_output)))
-        # )
-
-        ets = state_dict["ets"]
-
-        ets = ets.at[3].set(jnp.where(
-            state.counter >= 4,
-            model_output,
-            state_dict["ets"][3]
-        ))
-        ets = ets.at[2].set(jnp.where(
-            state.counter >= 3,
-            model_output,
-            state_dict["ets"][3]
-        ))
-        ets = ets.at[1].set(jnp.where(
-            state.counter >= 2,
-            model_output,
-            state_dict["ets"][2]
-        ))
-        ets = ets.at[0].set(jnp.where(
-            state.counter > 1,
-            state_dict["ets"][1],
-            state_dict["ets"][0]
-        ))
-        ets = ets.at[0].set(jnp.where(
-            state.counter == 0,
-            model_output,
-            state_dict["ets"][0]
-        ))
-        state_dict["ets"] = ets
 
         # if len(state.ets) == 1 and state.counter == 0:
         #     model_output = model_output
@@ -312,6 +277,10 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         #     model_output = (1 / 24) * (55 * state.ets[-1] - 59 * state.ets[-2] + 37 * state.ets[-3] - 9 * state.ets[-4])
 
         def counter_0(state_dict):
+            ets = state_dict["ets"]
+            ets = ets.at[0].set(model_output)
+            state_dict["ets"] = ets
+
             state_dict["sample"] = sample
             state_dict["model_output"] = model_output
             return state_dict
@@ -322,20 +291,34 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
 
         def counter_2(state_dict):
             ets = state_dict["ets"]
+            ets = ets.at[1].set(model_output)
+            state_dict["ets"] = ets
+
             state_dict["model_output"] = (3 * ets[1] - ets[0]) / 2
             state_dict["sample"] = sample
             return state_dict
 
         def counter_3(state_dict):
             ets = state_dict["ets"]
+            ets = ets.at[2].set(model_output)
+            state_dict["ets"] = ets
+
             state_dict["model_output"] = (23 * ets[2] - 16 * ets[1] + 5 * ets[0]) / 12
             state_dict["sample"] = sample
             return state_dict
 
         def counter_other(state_dict):
             ets = state_dict["ets"]
+            ets = ets.at[3].set(model_output)
+
             state_dict["model_output"] = (1 / 24) * (55 * ets[3] - 59 * ets[2] + 37 * ets[1] - 9 * ets[0])
             state_dict["sample"] = sample
+
+            ets = ets.at[0].set(ets[1])
+            ets = ets.at[1].set(ets[2])
+            ets = ets.at[2].set(ets[3])
+            state_dict["ets"] = ets
+
             return state_dict
 
         counter = jnp.clip(state.counter, 0, 4)
