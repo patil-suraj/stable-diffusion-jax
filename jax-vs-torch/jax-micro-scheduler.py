@@ -8,6 +8,12 @@ device_type = jax.devices()[0].device_kind
 print(f"Found {num_devices} JAX devices of type {device_type}.")
 # assert device_type.startswith("TPU"), "Available device is not a TPU, please select TPU from Edit > Notebook settings > Hardware accelerator"
 
+# Run tests on a single device of the specified family
+device = "cuda"
+devices = jax.devices(device)[:1]
+# devices = jax.devices()[:1]
+print(f"Running tests on {devices}")
+
 import jax.numpy as jnp
 from flax.jax_utils import replicate
 from flax.training.common_utils import shard
@@ -61,19 +67,12 @@ def mini_sample(
 
 p_sample = jax.pmap(mini_sample, in_axes=(0, 0, None), static_broadcasted_argnums=(2,3))
 
-# Run tests on a single device: "tpu" or "cpu".
-# Running iteratively is very slow, so `shard` and `replicate` anyway.
-
-devices = jax.devices("cpu")[:1]
-# devices = jax.devices()[:1]
-print(devices)
-
 num_inference_steps = 50
 
 latents = jnp.array([[0.34100962, -1.0947237, -1.778018, 0.43691084]])
 latents = jax.device_put_sharded([latents], devices)
 scheduler_state_dict = initial_state.copy()
-latents, _ = mini_sample(latents, scheduler_state_dict, 50, 51)
+latents, _ = mini_sample(latents, scheduler_state_dict, num_inference_steps, num_inference_steps+1)
 
 
 # for step in range(2):
