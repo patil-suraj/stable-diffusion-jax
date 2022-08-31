@@ -196,25 +196,84 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
         prev_timestep = timestep - self.config.num_train_timesteps // self.num_inference_steps
         prev_timestep = jnp.where(prev_timestep > 0, prev_timestep, 0)
 
-        if self.counter != 1:
-            self.ets.append(model_output)
-        else:
-            prev_timestep = timestep
-            timestep = timestep + self.config.num_train_timesteps // self.num_inference_steps
+        # Reference:
+        # if state.counter != 1:
+        #     state.ets.append(model_output)
+        # else:
+        #     prev_timestep = timestep
+        #     timestep = timestep + self.config.num_train_timesteps // state.num_inference_steps
 
-        if len(self.ets) == 1 and self.counter == 0:
-            model_output = model_output
-            self.cur_sample = sample
-        elif len(self.ets) == 1 and self.counter == 1:
-            model_output = (model_output + self.ets[-1]) / 2
-            sample = self.cur_sample
-            self.cur_sample = None
-        elif len(self.ets) == 2:
-            model_output = (3 * self.ets[-1] - self.ets[-2]) / 2
-        elif len(self.ets) == 3:
-            model_output = (23 * self.ets[-1] - 16 * self.ets[-2] + 5 * self.ets[-3]) / 12
-        else:
-            model_output = (1 / 24) * (55 * self.ets[-1] - 59 * self.ets[-2] + 37 * self.ets[-3] - 9 * self.ets[-4])
+        prev_timestep = jnp.where(state.counter == 1, timestep, prev_timestep)
+        timestep = jnp.where(state.counter == 1, timestep + self.config.num_train_timesteps // state.num_inference_steps, timestep)
+
+        # Reference:
+        # if len(state.ets) == 1 and state.counter == 0:
+        #     model_output = model_output
+        #     state.cur_sample = sample
+        # elif len(state.ets) == 1 and state.counter == 1:
+        #     model_output = (model_output + state.ets[-1]) / 2
+        #     sample = state.cur_sample
+        #     state.cur_sample = None
+        # elif len(state.ets) == 2:
+        #     model_output = (3 * state.ets[-1] - state.ets[-2]) / 2
+        # elif len(state.ets) == 3:
+        #     model_output = (23 * state.ets[-1] - 16 * state.ets[-2] + 5 * state.ets[-3]) / 12
+        # else:
+        #     model_output = (1 / 24) * (55 * state.ets[-1] - 59 * state.ets[-2] + 37 * state.ets[-3] - 9 * state.ets[-4])
+
+        def counter_0(state: PNDMSchedulerState):
+            ets = state.ets.at[0].set(model_output)
+            return state.replace(
+                ets = ets,
+                sample = sample,
+                model_output = jnp.array(model_output, dtype=jnp.float32),
+            )
+
+        def counter_1(state: PNDMSchedulerState):
+            return state.replace(
+                model_output = (model_output + state.ets[0]) / 2,
+            )
+
+        def counter_2(state: PNDMSchedulerState):
+            ets = state.ets.at[1].set(model_output)
+            return state.replace(
+                ets = ets,
+                model_output = (3 * ets[1] - ets[0]) / 2,
+                sample = sample,
+            )
+
+        def counter_3(state: PNDMSchedulerState):
+            ets = state.ets.at[2].set(model_output)
+            return state.replace(
+                ets = ets,
+                model_output = (23 * ets[2] - 16 * ets[1] + 5 * ets[0]) / 12,
+                sample = sample,
+            )            
+
+        def counter_other(state: PNDMSchedulerState):
+            ets = state.ets.at[3].set(model_output)
+            next_model_output = (1 / 24) * (55 * ets[3] - 59 * ets[2] + 37 * ets[1] - 9 * ets[0])
+
+            ets = ets.at[0].set(ets[1])
+            ets = ets.at[1].set(ets[2])
+            ets = ets.at[2].set(ets[3])
+
+            return state.replace(
+                ets = ets,
+                model_output = next_model_output,
+                sample = sample,
+            )
+
+        counter = jnp.clip(state.counter, 0, 4)
+        state = jax.lax.switch(
+            counter,
+            [counter_0, counter_1, counter_2, counter_3, counter_other],
+            state,
+        )
+
+        sample = state.sample
+        model_output = state.model_output
+        prev_sample = self._get_prev_sample(state, sample, timestep, prev_timestep, model_output)
 
         prev_sample = self._get_prev_sample(sample, timestep, prev_timestep, model_output)
         self.counter += 1
