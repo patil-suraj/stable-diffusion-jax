@@ -245,7 +245,7 @@ class PNDMScheduler(SchedulerMixin, ConfigMixin):
             return state.replace(
                 ets = ets,
                 sample = sample,
-                model_output = model_output,
+                model_output = jnp.array(model_output, dtype=jnp.float32),
             )
 
         def counter_1(state: PNDMSchedulerState):
