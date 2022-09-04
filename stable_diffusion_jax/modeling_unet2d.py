@@ -12,8 +12,10 @@ from .configuration_unet2d import UNet2DConfig
 
 def get_sinusoidal_embeddings(timesteps, embedding_dim):
     half_dim = embedding_dim // 2
-    emb = math.log(10000) / (half_dim - 1)
-    emb = jnp.exp(jnp.arange(half_dim) * -emb)
+    emb = -math.log(10000) * jnp.arange(half_dim, dtype=jnp.float32)
+    emb = emb / half_dim
+    emb = jnp.exp(emb)
+
     emb = timesteps[:, None] * emb[None, :]
     emb = jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], -1)
     return emb
