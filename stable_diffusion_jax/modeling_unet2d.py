@@ -5,9 +5,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
-
-from .configuration_unet2d import UNet2DConfig
+from diffusers.configuration_utils import ConfigMixin
+from .modeling_utils import ModelMixin, register_to_config
 
 
 def get_sinusoidal_embeddings(timesteps, embedding_dim):
@@ -571,14 +570,22 @@ class UNetMidBlock2DCrossAttn(nn.Module):
 
 
 class UNet2DModule(nn.Module):
-    config: UNet2DConfig
+    # config args
+    sample_size:int=32
+    in_channels:int=4
+    out_channels:int=4
+    down_block_types:Tuple=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")
+    up_block_types:Tuple=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")
+    block_out_channels:Tuple=(224, 448, 672, 896)
+    layers_per_block:int=2
+    attention_head_dim:int=8
+    cross_attention_dim:int=768
+    dropout:float=0.1
+    # model args
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
-        config = self.config
-
-        self.sample_size = config.sample_size
-        block_out_channels = config.block_out_channels
+        block_out_channels = self.block_out_channels
         time_embed_dim = block_out_channels[0] * 4
 
         # input
@@ -597,7 +604,7 @@ class UNet2DModule(nn.Module):
         # down
         down_blocks = []
         output_channel = block_out_channels[0]
-        for i, down_block_type in enumerate(config.down_block_types):
+        for i, down_block_type in enumerate(self.down_block_types):
             input_channel = output_channel
             output_channel = block_out_channels[i]
             is_final_block = i == len(block_out_channels) - 1
@@ -606,9 +613,9 @@ class UNet2DModule(nn.Module):
                 down_block = CrossAttnDownBlock2D(
                     in_channels=input_channel,
                     out_channels=output_channel,
-                    dropout=config.dropout,
-                    num_layers=config.layers_per_block,
-                    attn_num_head_channels=config.attention_head_dim,
+                    dropout=self.dropout,
+                    num_layers=self.layers_per_block,
+                    attn_num_head_channels=self.attention_head_dim,
                     add_downsample=not is_final_block,
                     dtype=self.dtype,
                 )
@@ -616,8 +623,8 @@ class UNet2DModule(nn.Module):
                 down_block = DownBlock2D(
                     in_channels=input_channel,
                     out_channels=output_channel,
-                    dropout=config.dropout,
-                    num_layers=config.layers_per_block,
+                    dropout=self.dropout,
+                    num_layers=self.layers_per_block,
                     add_downsample=not is_final_block,
                     dtype=self.dtype,
                 )
@@ -628,8 +635,8 @@ class UNet2DModule(nn.Module):
         # mid
         self.mid_block = UNetMidBlock2DCrossAttn(
             in_channels=block_out_channels[-1],
-            dropout=config.dropout,
-            attn_num_head_channels=config.attention_head_dim,
+            dropout=self.dropout,
+            attn_num_head_channels=self.attention_head_dim,
             dtype=self.dtype,
         )
 
@@ -637,7 +644,7 @@ class UNet2DModule(nn.Module):
         up_blocks = []
         reversed_block_out_channels = list(reversed(block_out_channels))
         output_channel = reversed_block_out_channels[0]
-        for i, up_block_type in enumerate(config.up_block_types):
+        for i, up_block_type in enumerate(self.up_block_types):
             prev_output_channel = output_channel
             output_channel = reversed_block_out_channels[i]
             input_channel = reversed_block_out_channels[min(i + 1, len(block_out_channels) - 1)]
@@ -649,10 +656,10 @@ class UNet2DModule(nn.Module):
                     in_channels=input_channel,
                     out_channels=output_channel,
                     prev_output_channel=prev_output_channel,
-                    num_layers=config.layers_per_block + 1,
-                    attn_num_head_channels=config.attention_head_dim,
+                    num_layers=self.layers_per_block + 1,
+                    attn_num_head_channels=self.attention_head_dim,
                     add_upsample=not is_final_block,
-                    dropout=config.dropout,
+                    dropout=self.dropout,
                     dtype=self.dtype,
                 )
             else:
@@ -660,9 +667,9 @@ class UNet2DModule(nn.Module):
                     in_channels=input_channel,
                     out_channels=output_channel,
                     prev_output_channel=prev_output_channel,
-                    num_layers=config.layers_per_block + 1,
+                    num_layers=self.layers_per_block + 1,
                     add_upsample=not is_final_block,
-                    dropout=config.dropout,
+                    dropout=self.dropout,
                     dtype=self.dtype,
                 )
 
@@ -673,7 +680,7 @@ class UNet2DModule(nn.Module):
         # out
         self.conv_norm_out = nn.GroupNorm(num_groups=32, epsilon=1e-5)
         self.conv_out = nn.Conv(
-            config.out_channels,
+            self.out_channels,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding=((1, 1), (1, 1)),
@@ -705,8 +712,8 @@ class UNet2DModule(nn.Module):
 
         # 5. up
         for up_block in self.up_blocks:
-            res_samples = down_block_res_samples[-(self.config.layers_per_block + 1) :]
-            down_block_res_samples = down_block_res_samples[: -(self.config.layers_per_block + 1)]
+            res_samples = down_block_res_samples[-(self.layers_per_block + 1) :]
+            down_block_res_samples = down_block_res_samples[: -(self.layers_per_block + 1)]
             if isinstance(up_block, CrossAttnUpBlock2D):
                 sample = up_block(
                     sample,
@@ -725,29 +732,40 @@ class UNet2DModule(nn.Module):
         return sample
 
 
-class UNet2DPretrainedModel(FlaxPreTrainedModel):
-    config_class = UNet2DConfig
+class UNet2D(ModelMixin, ConfigMixin):
     base_model_prefix = "model"
-    module_class: nn.Module = None
+    module_class: nn.Module = UNet2DModule
 
+    @register_to_config
     def __init__(
         self,
-        config: UNet2DConfig,
+        # config args
+        sample_size=32,
+        in_channels=4,
+        out_channels=4,
+        down_block_types=("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+        block_out_channels=(224, 448, 672, 896),
+        layers_per_block=2,
+        attention_head_dim=8,
+        cross_attention_dim=768,
+        dropout=0.1,
+        # model args
         input_shape: Tuple = (1, 32, 32, 4),
         seed: int = 0,
         dtype: jnp.dtype = jnp.float32,
         _do_init: bool = True,
         **kwargs,
     ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
+        module = self.module_class(sample_size=sample_size, in_channels=in_channels, out_channels=out_channels, down_block_types=down_block_types, up_block_types=up_block_types, block_out_channels=block_out_channels, layers_per_block=layers_per_block, attention_head_dim=attention_head_dim, cross_attention_dim=cross_attention_dim, dropout=dropout, dtype=dtype, **kwargs)
+        super().__init__(module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple) -> FrozenDict:
         # init input tensors
-        sample_shape = (1, self.config.sample_size, self.config.sample_size, self.config.in_channels)
+        sample_shape = (1, self.module.sample_size, self.module.sample_size, self.module.in_channels)
         sample = jnp.zeros(sample_shape, dtype=jnp.float32)
         timestpes = jnp.ones((1,), dtype=jnp.int32)
-        encoder_hidden_states = jnp.zeros((1, 1, self.config.cross_attention_dim), dtype=jnp.float32)
+        encoder_hidden_states = jnp.zeros((1, 1, self.module.cross_attention_dim), dtype=jnp.float32)
 
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
@@ -774,7 +792,3 @@ class UNet2DPretrainedModel(FlaxPreTrainedModel):
             not train,
             rngs=rngs,
         )
-
-
-class UNet2D(UNet2DPretrainedModel):
-    module_class = UNet2DModule
