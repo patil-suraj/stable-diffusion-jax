@@ -15,9 +15,8 @@
 
 
 import os
+import functools
 import inspect
-import functools 
-from functools import partial
 from pickle import UnpicklingError
 from typing import Any, Dict, Set, Tuple, Union
 
@@ -25,7 +24,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import msgpack.exceptions
-from flax.core.frozen_dict import FrozenDict, unfreeze
+from flax.core.frozen_dict import FrozenDict
 from flax.serialization import from_bytes, to_bytes
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.random import PRNGKey
@@ -43,123 +42,17 @@ FLAX_WEIGHTS_NAME = "flax_model.msgpack" # TODO should be "diffusion_flax_model.
 logger = logging.get_logger(__name__)
 
 
-# idedentical to diffusers.config_utils.register_to_config except one difference:
-# KEEP_ARGS = ["_do_init"] since "_do_init" starts with underscore, it was being excluded from `init_kwargs`
-def register_to_config(init):
-    """
-    Decorator to apply on the init of classes inheriting from `ConfigMixin` so that all the arguments are automatically
-    sent to `self.register_for_config`. To ignore a specific argument accepted by the init but that shouldn't be
-    registered in the config, use the `ignore_for_config` class variable
-
-    Warning: Once decorated, all private arguments (beginning with an underscore) are trashed and not sent to the init!
-    """
-
-    @functools.wraps(init)
-    def inner_init(self, *args, **kwargs):
-        # TODO: added change
-        KEEP_ARGS = ["_do_init"]
-        # Ignore private kwargs in the init.
-        init_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_") or k in KEEP_ARGS }
-        init(self, *args, **init_kwargs)
-        if not isinstance(self, ConfigMixin):
-            raise RuntimeError(
-                f"`@register_for_config` was applied to {self.__class__.__name__} init method, but this class does "
-                "not inherit from `ConfigMixin`."
-            )
-
-        ignore = getattr(self, "ignore_for_config", [])
-        # Get positional arguments aligned with kwargs
-        new_kwargs = {}
-        signature = inspect.signature(init)
-        parameters = {
-            name: p.default for i, (name, p) in enumerate(signature.parameters.items()) if i > 0 and name not in ignore
-        }
-        for arg, name in zip(args, parameters.keys()):
-            new_kwargs[name] = arg
-
-        # Then add all kwargs
-        new_kwargs.update(
-            {
-                k: init_kwargs.get(k, default)
-                for k, default in parameters.items()
-                if k not in ignore and k not in new_kwargs
-            }
-        )
-        getattr(self, "register_to_config")(**new_kwargs)
-
-    return inner_init
-
-
 class ModelMixin():
     r"""
     Base class for all models.
 
     [`ModelMixin`] takes care of storing the configuration of the models and handles methods for loading,
     downloading and saving models.
-
-    Class attributes (overridden by derived classes):
-
-        - **config_class** ([`PretrainedConfig`]) -- A subclass of [`PretrainedConfig`] to use as configuration class
-          for this model architecture.
-        - **base_model_prefix** (`str`) -- A string indicating the attribute associated to the base model in derived
-          classes of the same architecture adding modules on top of the base model.
-        - **main_input_name** (`str`) -- The name of the principal input to the model (often `input_ids` for NLP
-          models, `pixel_values` for vision models and `input_values` for speech models).
     """
-    base_model_prefix = ""
-    main_input_name = "input_ids"
-    _auto_class = None
     _missing_keys = set()
     config_name = CONFIG_NAME
+    ignore_for_config = ["parent", "name"]
     _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
-
-    def __init__(
-        self,
-        module: nn.Module,
-        input_shape: Tuple = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
-    ):
-        if module is None:
-            raise ValueError("module cannot be None")
-
-        # Those are private to be exposed as typed property on derived classes.
-        self._module = module
-
-        # Those are public as their type is generic to every derived classes.
-        self.key = PRNGKey(seed)
-        self.dtype = dtype
-        self.input_shape = input_shape
-
-        # To check if the model was intialized automatically.
-        self._is_initialized = _do_init
-
-        if _do_init:
-            # randomly initialized parameters
-            random_params = self.init_weights(self.key, input_shape)
-            params_shape_tree = jax.eval_shape(lambda params: params, random_params)
-        else:
-            init_fn = partial(self.init_weights, input_shape=input_shape)
-            params_shape_tree = jax.eval_shape(init_fn, self.key)
-
-            logger.info(
-                "Model weights are not initialized as `_do_init` is set to `False`. "
-                f"Make sure to call `{self.__class__.__name__}.init_weights` manually to initialize the weights."
-            )
-
-        # get the shape of the parameters
-        self._params_shape_tree = params_shape_tree
-
-        # save required_params as set
-        self._required_params = set(flatten_dict(unfreeze(params_shape_tree)).keys())
-
-        # initialize the parameters
-        if _do_init:
-            self.params = random_params
-
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> Dict:
-        raise NotImplementedError(f"init method has to be implemented for {self}")
 
     @classmethod
     def _from_config(cls, config, **kwargs):
@@ -174,47 +67,6 @@ class ModelMixin():
         :str: Identifies that this is a Flax model.
         """
         return "flax"
-
-    @property
-    def module(self) -> nn.Module:
-        return self._module
-
-    @property
-    def params(self) -> Union[Dict, FrozenDict]:
-        if not self._is_initialized:
-            raise ValueError(
-                "`params` cannot be accessed from model when the model is created with `_do_init=False`. "
-                "You must call `init_weights` manually and store the params outside of the model and "
-                "pass it explicitly where needed."
-            )
-        return self._params
-
-    @property
-    def required_params(self) -> Set:
-        return self._required_params
-
-    @property
-    def params_shape_tree(self) -> Dict:
-        return self._params_shape_tree
-
-    @params.setter
-    def params(self, params: Union[Dict, FrozenDict]):
-        # don't set params if the model is not initialized
-        if not self._is_initialized:
-            raise ValueError(
-                "`params` cannot be set from model when the model is created with `_do_init=False`. "
-                "You store the params outside of the model."
-            )
-
-        if isinstance(params, FrozenDict):
-            params = unfreeze(params)
-        param_keys = set(flatten_dict(params).keys())
-        if len(self.required_params - param_keys) > 0:
-            raise ValueError(
-                "Some parameters are missing. Make sure that `params` include the following "
-                f"parameters {self.required_params - param_keys}"
-            )
-        self._params = params
 
     def _cast_floating_to(self, params: Union[Dict, FrozenDict], dtype: jnp.dtype, mask: Any = None) -> Any:
         """
@@ -458,7 +310,6 @@ class ModelMixin():
         ```"""
         config = kwargs.pop("config", None)
         cache_dir = kwargs.pop("cache_dir", None) # TODO: use DIFFUSERS_CACHE
-        ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
@@ -467,7 +318,6 @@ class ModelMixin():
         revision = kwargs.pop("revision", None)
         from_auto_class = kwargs.pop("_from_auto", False)
         subfolder = kwargs.pop("subfolder", None)
-        _do_init = kwargs.pop("_do_init", True)
 
         user_agent = {"file_type": "model", "framework": "flax", "from_auto_class": from_auto_class}
 
@@ -485,7 +335,6 @@ class ModelMixin():
             revision=revision,
             # model args
             dtype = dtype,
-            _do_init = _do_init,
             **kwargs,
         )
 
@@ -578,100 +427,10 @@ class ModelMixin():
         # make sure all arrays are stored as jnp.arrays
         # NOTE: This is to prevent a bug this will be fixed in Flax >= v0.3.4:
         # https://github.com/google/flax/issues/1261
-        if _do_init:
-            state = jax.tree_util.tree_map(jnp.array, state)
-        else:
-            # keep the params on CPU if we don't want to initialize
-            state = jax.tree_util.tree_map(lambda x: jax.device_put(x, jax.devices("cpu")[0]), state)
-
-        # if model is base model only use model_prefix key
-        if cls.base_model_prefix not in dict(model.params_shape_tree) and cls.base_model_prefix in state:
-            state = state[cls.base_model_prefix]
-
-        # if model is head model and we are loading weights from base model
-        # we initialize new params dict with base_model_prefix
-        if cls.base_model_prefix in dict(model.params_shape_tree) and cls.base_model_prefix not in state:
-            state = {cls.base_model_prefix: state}
+        state = jax.tree_util.tree_map(lambda x: jax.device_put(x, jax.devices("cpu")[0]), state)
 
         # flatten dicts
         state = flatten_dict(state)
-
-        random_state = flatten_dict(unfreeze(model.params if _do_init else model.params_shape_tree))
-
-        missing_keys = model.required_params - set(state.keys())
-        unexpected_keys = set(state.keys()) - model.required_params
-
-        if missing_keys and not _do_init:
-            logger.warning(
-                f"The checkpoint {pretrained_model_name_or_path} is missing required keys: {missing_keys}. "
-                "Make sure to call model.init_weights to initialize the missing weights."
-            )
-            cls._missing_keys = missing_keys
-
-        # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
-        # matching the weights in the model.
-        mismatched_keys = []
-        for key in state.keys():
-            if key in random_state and state[key].shape != random_state[key].shape:
-                if ignore_mismatched_sizes:
-                    mismatched_keys.append((key, state[key].shape, random_state[key].shape))
-                    state[key] = random_state[key]
-                else:
-                    raise ValueError(
-                        f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
-                        f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
-                        "Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
-                        "model."
-                    )
-
-        # add missing keys as random parameters if we are initializing
-        if missing_keys and _do_init:
-            for missing_key in missing_keys:
-                state[missing_key] = random_state[missing_key]
-
-        # remove unexpected keys to not be saved again
-        for unexpected_key in unexpected_keys:
-            del state[unexpected_key]
-
-        if len(unexpected_keys) > 0:
-            logger.warning(
-                f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when"
-                f" initializing {model.__class__.__name__}: {unexpected_keys}\n- This IS expected if you are"
-                f" initializing {model.__class__.__name__} from the checkpoint of a model trained on another task or"
-                " with another architecture (e.g. initializing a BertForSequenceClassification model from a"
-                " BertForPreTraining model).\n- This IS NOT expected if you are initializing"
-                f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
-                " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
-            )
-        else:
-            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
-
-        if len(missing_keys) > 0:
-            logger.warning(
-                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
-                f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
-                " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
-            )
-        elif len(mismatched_keys) == 0:
-            logger.info(
-                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at"
-                f" {pretrained_model_name_or_path}.\nIf your task is similar to the task the model of the checkpoint"
-                f" was trained on, you can already use {model.__class__.__name__} for predictions without further"
-                " training."
-            )
-        if len(mismatched_keys) > 0:
-            mismatched_warning = "\n".join(
-                [
-                    f"- {key}: found shape {shape1} in the checkpoint and {shape2} in the model instantiated"
-                    for key, shape1, shape2 in mismatched_keys
-                ]
-            )
-            logger.warning(
-                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
-                f" {pretrained_model_name_or_path} and are newly initialized because the shapes did not"
-                f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
-                " to use it for predictions and inference."
-            )
 
         # dictionary of key: dtypes for the model params
         param_dtypes = jax.tree_map(lambda x: x.dtype, state)
@@ -696,14 +455,9 @@ class ModelMixin():
                 "See [`~ModelMixin.to_fp32`] for further information on how to do this."
             )
 
-        if _do_init:
-            # set correct parameters
-            model.params = unflatten_dict(state)
-            return model
-        else:
-            return model, unflatten_dict(state)
+        return model, unflatten_dict(state)
 
-    def save_pretrained(self, save_directory: Union[str, os.PathLike], params=None, **kwargs):
+    def save_pretrained(self, save_directory: Union[str, os.PathLike], params: Union[Dict, FrozenDict], is_main_process: bool = True, **kwargs):
         """
         Save a model and its configuration file to a directory, so that it can be re-loaded using the
         `[`~FlaxPreTrainedModel.from_pretrained`]` class method
@@ -731,18 +485,56 @@ class ModelMixin():
 
         os.makedirs(save_directory, exist_ok=True)
 
-        # get abs dir
-        save_directory = os.path.abspath(save_directory)
-        # save config as well
-        self.config.architectures = [self.__class__.__name__[4:]]
+        model_to_save = self
 
-        self.config.save_pretrained(save_directory)
+        # Attach architecture to the config
+        # Save the config
+        if is_main_process:
+            model_to_save.save_config(save_directory)
 
         # save model
         output_model_file = os.path.join(save_directory, FLAX_WEIGHTS_NAME)
         with open(output_model_file, "wb") as f:
-            params = params if params is not None else self.params
             model_bytes = to_bytes(params)
             f.write(model_bytes)
 
         logger.info(f"Model weights saved in {output_model_file}")
+
+def register_to_config(cls):
+    original_init = cls.__init__
+
+    @functools.wraps(original_init)
+    def init(self, *args, **kwargs):
+        # Ignore private kwargs in the init.
+        init_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
+        # original_init(self, *args, **init_kwargs)
+        if not isinstance(self, ConfigMixin):
+            raise RuntimeError(
+                f"`@register_for_config` was applied to {self.__class__.__name__} init method, but this class does "
+                "not inherit from `ConfigMixin`."
+            )
+
+        ignore = getattr(self, "ignore_for_config", [])
+        # Get positional arguments aligned with kwargs
+        new_kwargs = {}
+        signature = inspect.signature(init)
+        parameters = {
+            name: p.default for i, (name, p) in enumerate(signature.parameters.items()) if i > 0 and name not in ignore
+        }
+        for arg, name in zip(args, parameters.keys()):
+            new_kwargs[name] = arg
+
+        # Then add all kwargs
+        new_kwargs.update(
+            {
+                k: init_kwargs.get(k, default)
+                for k, default in parameters.items()
+                if k not in ignore and k not in new_kwargs
+            }
+        )
+        getattr(self, "register_to_config")(**new_kwargs)
+
+        original_init(self, *args, **init_kwargs)
+    
+    cls.__init__ = init
+    return cls

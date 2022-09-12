@@ -68,8 +68,8 @@ class StableDiffusionPipeline:
             timestep = jnp.broadcast_to(t, latents_input.shape[0])
 
             # predict the noise residual
-            noise_pred = self.unet(
-                latents_input, timestep, encoder_hidden_states=context, params=inference_state.unet_params
+            noise_pred = self.unet.apply(
+                {"params": inference_state.unet_params}, jnp.array(latents_input), jnp.array(timestep, dtype=jnp.int32), encoder_hidden_states=context, rngs={}
             )
             # perform guidance
             noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)

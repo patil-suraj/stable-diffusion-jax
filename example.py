@@ -17,7 +17,7 @@ from stable_diffusion_jax import (
 
 
 # Local checkout until weights are available in the Hub
-flax_path = "/sddata/sd-v1-4-flax"
+flax_path = "/home/mishig/stable-diffusion-v1-4-flax"
 
 num_samples = 8
 num_inference_steps = 50
@@ -30,9 +30,9 @@ dtype = jnp.bfloat16
 clip_model, clip_params = FlaxCLIPTextModel.from_pretrained(
     "openai/clip-vit-large-patch14", _do_init=False, dtype=dtype
 )
-unet, unet_params = UNet2D.from_pretrained(f"{flax_path}/unet", _do_init=False, dtype=dtype)
+unet, unet_params = UNet2D.from_pretrained(f"{flax_path}/unet", dtype=dtype)
 vae, vae_params = AutoencoderKL.from_pretrained(f"{flax_path}/vae", _do_init=False, dtype=dtype)
-safety_model, safety_model_params = StableDiffusionSafetyCheckerModel.from_pretrained(f"{flax_path}/safety_checker", _do_init=False, dtype=dtype)
+# safety_model, safety_model_params = StableDiffusionSafetyCheckerModel.from_pretrained(f"{flax_path}/safety_checker", _do_init=False, dtype=dtype)
 
 config = CLIPConfig.from_pretrained("openai/clip-vit-large-patch14")
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
@@ -67,7 +67,7 @@ pipe = StableDiffusionPipeline(text_encoder=clip_model, tokenizer=tokenizer, une
 
 
 # prepare inputs
-p = "A cinematic film still of Morgan Freeman starring as Jimi Hendrix, portrait, 40mm lens, shallow depth of field, close up, split lighting, cinematic"
+p = "Astronaut riding a horse"
 
 input_ids = tokenizer(
     [p] * num_samples, padding="max_length", truncation=True, max_length=77, return_tensors="jax"
