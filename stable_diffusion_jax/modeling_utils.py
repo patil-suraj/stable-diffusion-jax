@@ -1,5 +1,6 @@
 # coding=utf-8
-# Copyright 2021 The Google Flax Team Authors and The HuggingFace Inc. team.
+# Copyright 2022 The HuggingFace Inc. team.
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,41 +14,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-import os
 import functools
 import inspect
+import os
 from pickle import UnpicklingError
-from typing import Any, Dict, Set, Tuple, Union
+from typing import Any, Dict, Union
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import msgpack.exceptions
 from flax.core.frozen_dict import FrozenDict
 from flax.serialization import from_bytes, to_bytes
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.random import PRNGKey
-from requests import HTTPError
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+from requests import HTTPError
 
-from transformers.dynamic_module_utils import custom_object_save
-from diffusers.modeling_utils import WEIGHTS_NAME
 from diffusers.configuration_utils import ConfigMixin
+from diffusers.modeling_utils import WEIGHTS_NAME
 from diffusers.utils import CONFIG_NAME, DIFFUSERS_CACHE, HUGGINGFACE_CO_RESOLVE_ENDPOINT, logging
 
-FLAX_WEIGHTS_NAME = "flax_model.msgpack" # TODO should be "diffusion_flax_model.msgpack"
+
+FLAX_WEIGHTS_NAME = "flax_model.msgpack"  # TODO should be "diffusion_flax_model.msgpack"
 
 logger = logging.get_logger(__name__)
 
 
-class ModelMixin():
+class ModelMixin:
     r"""
     Base class for all models.
 
-    [`ModelMixin`] takes care of storing the configuration of the models and handles methods for loading,
-    downloading and saving models.
+    [`ModelMixin`] takes care of storing the configuration of the models and handles methods for loading, downloading
+    and saving models.
     """
     _missing_keys = set()
     config_name = CONFIG_NAME
@@ -203,9 +201,8 @@ class ModelMixin():
         pretrained_model_name_or_path: Union[str, os.PathLike],
         dtype: jnp.dtype = jnp.float32,
         *model_args,
-        **kwargs
+        **kwargs,
     ):
-
         r"""
         Instantiate a pretrained flax model from a pre-trained model configuration.
 
@@ -223,8 +220,8 @@ class ModelMixin():
                     - A string, the *model id* of a pretrained model hosted inside a model repo on huggingface.co.
                       Valid model ids can be located at the root-level, like `bert-base-uncased`, or namespaced under a
                       user or organization name, like `dbmdz/bert-base-german-cased`.
-                    - A path to a *directory* containing model weights saved using
-                      [`~ModelMixin.save_pretrained`], e.g., `./my_model_directory/`.
+                    - A path to a *directory* containing model weights saved using [`~ModelMixin.save_pretrained`],
+                      e.g., `./my_model_directory/`.
                     - A path or url to a *pt index checkpoint file* (e.g, `./tf_model/model.ckpt.index`). In this case,
                       `from_pt` should be set to `True`.
             dtype (`jax.numpy.dtype`, *optional*, defaults to `jax.numpy.float32`):
@@ -309,7 +306,7 @@ class ModelMixin():
         >>> model = FlaxBertModel.from_pretrained("./pt_model/pytorch_model.bin", from_pt=True, config=config)
         ```"""
         config = kwargs.pop("config", None)
-        cache_dir = kwargs.pop("cache_dir", None) # TODO: use DIFFUSERS_CACHE
+        cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
@@ -334,7 +331,7 @@ class ModelMixin():
             use_auth_token=use_auth_token,
             revision=revision,
             # model args
-            dtype = dtype,
+            dtype=dtype,
             **kwargs,
         )
 
@@ -355,58 +352,58 @@ class ModelMixin():
                     f"{pretrained_model_name_or_path}."
                 )
         else:
-                try:
-                    model_file = hf_hub_download(
-                        pretrained_model_name_or_path,
-                        filename=FLAX_WEIGHTS_NAME,
-                        cache_dir=cache_dir,
-                        force_download=force_download,
-                        proxies=proxies,
-                        resume_download=resume_download,
-                        local_files_only=local_files_only,
-                        use_auth_token=use_auth_token,
-                        user_agent=user_agent,
-                        subfolder=subfolder,
-                        revision=revision,
-                    )
+            try:
+                model_file = hf_hub_download(
+                    pretrained_model_name_or_path,
+                    filename=FLAX_WEIGHTS_NAME,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    proxies=proxies,
+                    resume_download=resume_download,
+                    local_files_only=local_files_only,
+                    use_auth_token=use_auth_token,
+                    user_agent=user_agent,
+                    subfolder=subfolder,
+                    revision=revision,
+                )
 
-                except RepositoryNotFoundError:
-                    raise EnvironmentError(
-                        f"{pretrained_model_name_or_path} is not a local folder and is not a valid model identifier "
-                        "listed on 'https://huggingface.co/models'\nIf this is a private repository, make sure to pass a "
-                        "token having permission to this repo with `use_auth_token` or log in with `huggingface-cli "
-                        "login` and pass `use_auth_token=True`."
-                    )
-                except RevisionNotFoundError:
-                    raise EnvironmentError(
-                        f"{revision} is not a valid git identifier (branch name, tag name or commit id) that exists for "
-                        "this model name. Check the model page at "
-                        f"'https://huggingface.co/{pretrained_model_name_or_path}' for available revisions."
-                    )
-                except EntryNotFoundError:
-                    raise EnvironmentError(
-                        f"{pretrained_model_name_or_path} does not appear to have a file named {FLAX_WEIGHTS_NAME}."
-                    )
-                except HTTPError as err:
-                    raise EnvironmentError(
-                        f"There was a specific connection error when trying to load {pretrained_model_name_or_path}:\n"
-                        f"{err}"
-                    )
-                except ValueError:
-                    raise EnvironmentError(
-                        f"We couldn't connect to '{HUGGINGFACE_CO_RESOLVE_ENDPOINT}' to load this model, couldn't find it"
-                        f" in the cached files and it looks like {pretrained_model_name_or_path} is not the path to a"
-                        f" directory containing a file named {FLAX_WEIGHTS_NAME} or {WEIGHTS_NAME}.\nCheckout your"
-                        " internet connection or see how to run the library in offline mode at"
-                        " 'https://huggingface.co/docs/transformers/installation#offline-mode'."
-                    )
-                except EnvironmentError:
-                    raise EnvironmentError(
-                        f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it from "
-                        "'https://huggingface.co/models', make sure you don't have a local directory with the same name. "
-                        f"Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a directory "
-                        f"containing a file named {FLAX_WEIGHTS_NAME} or {WEIGHTS_NAME}."
-                    )
+            except RepositoryNotFoundError:
+                raise EnvironmentError(
+                    f"{pretrained_model_name_or_path} is not a local folder and is not a valid model identifier "
+                    "listed on 'https://huggingface.co/models'\nIf this is a private repository, make sure to pass a "
+                    "token having permission to this repo with `use_auth_token` or log in with `huggingface-cli "
+                    "login` and pass `use_auth_token=True`."
+                )
+            except RevisionNotFoundError:
+                raise EnvironmentError(
+                    f"{revision} is not a valid git identifier (branch name, tag name or commit id) that exists for "
+                    "this model name. Check the model page at "
+                    f"'https://huggingface.co/{pretrained_model_name_or_path}' for available revisions."
+                )
+            except EntryNotFoundError:
+                raise EnvironmentError(
+                    f"{pretrained_model_name_or_path} does not appear to have a file named {FLAX_WEIGHTS_NAME}."
+                )
+            except HTTPError as err:
+                raise EnvironmentError(
+                    f"There was a specific connection error when trying to load {pretrained_model_name_or_path}:\n"
+                    f"{err}"
+                )
+            except ValueError:
+                raise EnvironmentError(
+                    f"We couldn't connect to '{HUGGINGFACE_CO_RESOLVE_ENDPOINT}' to load this model, couldn't find it"
+                    f" in the cached files and it looks like {pretrained_model_name_or_path} is not the path to a"
+                    f" directory containing a file named {FLAX_WEIGHTS_NAME} or {WEIGHTS_NAME}.\nCheckout your"
+                    " internet connection or see how to run the library in offline mode at"
+                    " 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+                )
+            except EnvironmentError:
+                raise EnvironmentError(
+                    f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it from "
+                    "'https://huggingface.co/models', make sure you don't have a local directory with the same name. "
+                    f"Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a directory "
+                    f"containing a file named {FLAX_WEIGHTS_NAME} or {WEIGHTS_NAME}."
+                )
 
         try:
             with open(model_file, "rb") as state_f:
@@ -457,7 +454,13 @@ class ModelMixin():
 
         return model, unflatten_dict(state)
 
-    def save_pretrained(self, save_directory: Union[str, os.PathLike], params: Union[Dict, FrozenDict], is_main_process: bool = True, **kwargs):
+    def save_pretrained(
+        self,
+        save_directory: Union[str, os.PathLike],
+        params: Union[Dict, FrozenDict],
+        is_main_process: bool = True,
+        **kwargs,
+    ):
         """
         Save a model and its configuration file to a directory, so that it can be re-loaded using the
         `[`~FlaxPreTrainedModel.from_pretrained`]` class method
@@ -500,7 +503,8 @@ class ModelMixin():
 
         logger.info(f"Model weights saved in {output_model_file}")
 
-def register_to_config(cls):
+
+def flax_register_to_config(cls):
     original_init = cls.__init__
 
     @functools.wraps(original_init)
@@ -535,6 +539,6 @@ def register_to_config(cls):
         getattr(self, "register_to_config")(**new_kwargs)
 
         original_init(self, *args, **init_kwargs)
-    
+
     cls.__init__ = init
     return cls
