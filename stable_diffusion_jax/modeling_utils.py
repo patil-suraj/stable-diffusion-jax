@@ -40,11 +40,11 @@ FLAX_WEIGHTS_NAME = "flax_model.msgpack"  # TODO should be "diffusion_flax_model
 logger = logging.get_logger(__name__)
 
 
-class ModelMixin:
+class FlaxModelMixin:
     r"""
     Base class for all models.
 
-    [`ModelMixin`] takes care of storing the configuration of the models and handles methods for loading, downloading
+    [`FlaxModelMixin`] takes care of storing the configuration of the models and handles methods for loading, downloading
     and saving models.
     """
     _missing_keys = set()

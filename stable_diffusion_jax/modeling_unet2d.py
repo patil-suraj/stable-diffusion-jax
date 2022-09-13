@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict
 from diffusers.configuration_utils import ConfigMixin
-from .modeling_utils import ModelMixin, flax_register_to_config
+from .modeling_utils import FlaxModelMixin, flax_register_to_config
 
 
 def get_sinusoidal_embeddings(timesteps, embedding_dim):
@@ -570,7 +570,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
 
 
 @flax_register_to_config
-class UNet2D(nn.Module, ModelMixin, ConfigMixin):
+class UNet2D(nn.Module, FlaxModelMixin, ConfigMixin):
     sample_size:int=32
     in_channels:int=4
     out_channels:int=4
