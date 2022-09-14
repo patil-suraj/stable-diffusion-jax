@@ -19,11 +19,11 @@ from stable_diffusion_jax import (
 # Local checkout until weights are available in the Hub
 flax_path = "/sddata/sd-v1-4-flax"
 
-num_samples = 8
+num_samples = 1
 num_inference_steps = 50
 guidance_scale = 7.5
 
-devices = jax.devices()[:1]
+devices = jax.devices()[:2]
 
 # inference with jax
 dtype = jnp.bfloat16
@@ -79,8 +79,8 @@ prng_seed = jax.random.PRNGKey(42)
 
 # shard inputs and rng
 # Simply use shard if using the default devices
-input_ids = jax.device_put_sharded([input_ids], devices)
-uncond_input_ids = jax.device_put_sharded([uncond_input_ids], devices)
+input_ids = jax.device_put_sharded([input_ids]*len(devices), devices)
+uncond_input_ids = jax.device_put_sharded([uncond_input_ids]*len(devices), devices)
 prng_seed = jax.random.split(prng_seed, len(devices))
 
 # pmap the sample function
@@ -100,7 +100,9 @@ images = sample(
 images = images / 2 + 0.5
 images = jnp.clip(images, 0, 1)
 images = (images * 255).round().astype("uint8")
-images = np.asarray(images).reshape((num_samples, 512, 512, 3))
+images = np.asarray(images).reshape((num_samples*len(devices), 512, 512, 3))
 
 pil_images = [Image.fromarray(image) for image in images]
-pil_images[0].save("example.png")
+for i, image in enumerate(pil_images):
+    image.save(f"example_{i}.png")
+
