@@ -5,8 +5,8 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict
-from diffusers.configuration_utils import ConfigMixin
-from .modeling_utils import FlaxModelMixin, flax_register_to_config
+from diffusers.configuration_utils import ConfigMixin, flax_register_to_config
+from .modeling_utils import FlaxModelMixin
 
 
 def get_sinusoidal_embeddings(timesteps, embedding_dim):
@@ -685,6 +685,18 @@ class UNet2D(nn.Module, FlaxModelMixin, ConfigMixin):
             padding=((1, 1), (1, 1)),
             dtype=self.dtype,
         )
+
+    def init_weights(self, rng: jax.random.PRNGKey) -> FrozenDict:
+        # init input tensors
+        sample_shape = (1, self.config.sample_size, self.config.sample_size, self.config.in_channels)
+        sample = jnp.zeros(sample_shape, dtype=jnp.float32)
+        timestpes = jnp.ones((1,), dtype=jnp.int32)
+        encoder_hidden_states = jnp.zeros((1, 1, self.config.cross_attention_dim), dtype=jnp.float32)
+
+        params_rng, dropout_rng = jax.random.split(rng)
+        rngs = {"params": params_rng, "dropout": dropout_rng}
+
+        return self.init(rngs, sample, timestpes, encoder_hidden_states)["params"]
 
     def __call__(self, sample, timesteps, encoder_hidden_states, deterministic=True):
 

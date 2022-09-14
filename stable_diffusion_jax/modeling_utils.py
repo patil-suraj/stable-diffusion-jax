@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright 2022 The HuggingFace Inc. team.
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
-import inspect
 import os
 from pickle import UnpicklingError
 from typing import Any, Dict, Union
@@ -23,34 +20,32 @@ from typing import Any, Dict, Union
 import jax
 import jax.numpy as jnp
 import msgpack.exceptions
-from flax.core.frozen_dict import FrozenDict
+from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.serialization import from_bytes, to_bytes
 from flax.traverse_util import flatten_dict, unflatten_dict
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
 from requests import HTTPError
 
-from diffusers.configuration_utils import ConfigMixin
 from diffusers.modeling_utils import WEIGHTS_NAME
 from diffusers.utils import CONFIG_NAME, DIFFUSERS_CACHE, HUGGINGFACE_CO_RESOLVE_ENDPOINT, logging
 
 
-FLAX_WEIGHTS_NAME = "flax_model.msgpack"  # TODO should be "diffusion_flax_model.msgpack"
+FLAX_WEIGHTS_NAME = "flax_model.msgpack"
 
 logger = logging.get_logger(__name__)
 
 
 class FlaxModelMixin:
     r"""
-    Base class for all models.
+    Base class for all flax models.
 
-    [`FlaxModelMixin`] takes care of storing the configuration of the models and handles methods for loading, downloading
-    and saving models.
+    [`FlaxModelMixin`] takes care of storing the configuration of the models and handles methods for loading,
+    downloading and saving models.
     """
-    _missing_keys = set()
     config_name = CONFIG_NAME
-    ignore_for_config = ["parent", "name"]
     _automatically_saved_args = ["_diffusers_version", "_class_name", "_name_or_path"]
+    _flax_internal_args = ["name", "parent"]
 
     @classmethod
     def _from_config(cls, config, **kwargs):
@@ -58,13 +53,6 @@ class FlaxModelMixin:
         All context managers that the model should be initialized under go here.
         """
         return cls(config, **kwargs)
-
-    @property
-    def framework(self) -> str:
-        """
-        :str: Identifies that this is a Flax model.
-        """
-        return "flax"
 
     def _cast_floating_to(self, params: Union[Dict, FrozenDict], dtype: jnp.dtype, mask: Any = None) -> Any:
         """
@@ -108,30 +96,30 @@ class FlaxModelMixin:
         Examples:
 
         ```python
-        >>> from transformers import FlaxBertModel
+        >>> from diffusers import FlaxUNet2DConditionModel
 
         >>> # load model
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
         >>> # By default, the model parameters will be in fp32 precision, to cast these to bfloat16 precision
-        >>> model.params = model.to_bf16(model.params)
-        >>> # If you want don't want to cast certain parameters (for example layer norm bias and scale)
+        >>> params = model.to_bf16(params)
+        >>> # If you don't want to cast certain parameters (for example layer norm bias and scale)
         >>> # then pass the mask as follows
         >>> from flax import traverse_util
 
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
-        >>> flat_params = traverse_util.flatten_dict(model.params)
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
+        >>> flat_params = traverse_util.flatten_dict(params)
         >>> mask = {
         ...     path: (path[-2] != ("LayerNorm", "bias") and path[-2:] != ("LayerNorm", "scale"))
         ...     for path in flat_params
         ... }
         >>> mask = traverse_util.unflatten_dict(mask)
-        >>> model.params = model.to_bf16(model.params, mask)
+        >>> params = model.to_bf16(params, mask)
         ```"""
         return self._cast_floating_to(params, jnp.bfloat16, mask)
 
     def to_fp32(self, params: Union[Dict, FrozenDict], mask: Any = None):
         r"""
-        Cast the floating-point `parmas` to `jax.numpy.float32`. This method can be used to explicitly convert the
+        Cast the floating-point `params` to `jax.numpy.float32`. This method can be used to explicitly convert the
         model parameters to fp32 precision. This returns a new `params` tree and does not cast the `params` in place.
 
         Arguments:
@@ -144,21 +132,21 @@ class FlaxModelMixin:
         Examples:
 
         ```python
-        >>> from transformers import FlaxBertModel
+        >>> from diffusers import FlaxUNet2DConditionModel
 
         >>> # Download model and configuration from huggingface.co
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
         >>> # By default, the model params will be in fp32, to illustrate the use of this method,
         >>> # we'll first cast to fp16 and back to fp32
-        >>> model.params = model.to_f16(model.params)
+        >>> params = model.to_f16(params)
         >>> # now cast back to fp32
-        >>> model.params = model.to_fp32(model.params)
+        >>> params = model.to_fp32(params)
         ```"""
         return self._cast_floating_to(params, jnp.float32, mask)
 
     def to_fp16(self, params: Union[Dict, FrozenDict], mask: Any = None):
         r"""
-        Cast the floating-point `parmas` to `jax.numpy.float16`. This returns a new `params` tree and does not cast the
+        Cast the floating-point `params` to `jax.numpy.float16`. This returns a new `params` tree and does not cast the
         `params` in place.
 
         This method can be used on GPU to explicitly convert the model parameters to float16 precision to do full
@@ -174,26 +162,29 @@ class FlaxModelMixin:
         Examples:
 
         ```python
-        >>> from transformers import FlaxBertModel
+        >>> from diffusers import FlaxUNet2DConditionModel
 
         >>> # load model
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
         >>> # By default, the model params will be in fp32, to cast these to float16
-        >>> model.params = model.to_fp16(model.params)
+        >>> params = model.to_fp16(params)
         >>> # If you want don't want to cast certain parameters (for example layer norm bias and scale)
         >>> # then pass the mask as follows
         >>> from flax import traverse_util
 
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
-        >>> flat_params = traverse_util.flatten_dict(model.params)
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
+        >>> flat_params = traverse_util.flatten_dict(params)
         >>> mask = {
         ...     path: (path[-2] != ("LayerNorm", "bias") and path[-2:] != ("LayerNorm", "scale"))
         ...     for path in flat_params
         ... }
         >>> mask = traverse_util.unflatten_dict(mask)
-        >>> model.params = model.to_fp16(model.params, mask)
+        >>> params = model.to_fp16(params, mask)
         ```"""
         return self._cast_floating_to(params, jnp.float16, mask)
+
+    def init_weights(self, rng: jax.random.PRNGKey) -> Dict:
+        raise NotImplementedError(f"init method has to be implemented for {self}")
 
     @classmethod
     def from_pretrained(
@@ -218,12 +209,10 @@ class FlaxModelMixin:
                 Can be either:
 
                     - A string, the *model id* of a pretrained model hosted inside a model repo on huggingface.co.
-                      Valid model ids can be located at the root-level, like `bert-base-uncased`, or namespaced under a
-                      user or organization name, like `dbmdz/bert-base-german-cased`.
+                      Valid model ids are namespaced under a user or organization name, like
+                      `CompVis/stable-diffusion-v1-4`.
                     - A path to a *directory* containing model weights saved using [`~ModelMixin.save_pretrained`],
                       e.g., `./my_model_directory/`.
-                    - A path or url to a *pt index checkpoint file* (e.g, `./tf_model/model.ckpt.index`). In this case,
-                      `from_pt` should be set to `True`.
             dtype (`jax.numpy.dtype`, *optional*, defaults to `jax.numpy.float32`):
                 The data type of the computation. Can be one of `jax.numpy.float32`, `jax.numpy.float16` (on GPUs) and
                 `jax.numpy.bfloat16` (on TPUs).
@@ -238,27 +227,9 @@ class FlaxModelMixin:
                 [`~ModelMixin.to_bf16`].
             model_args (sequence of positional arguments, *optional*):
                 All remaining positional arguments will be passed to the underlying model's `__init__` method.
-            config (`Union[PretrainedConfig, str, os.PathLike]`, *optional*):
-                Can be either:
-
-                    - an instance of a class derived from [`PretrainedConfig`],
-                    - a string or path valid as input to [`~PretrainedConfig.from_pretrained`].
-
-                Configuration for the model to use instead of an automatically loaded configuration. Configuration can
-                be automatically loaded when:
-
-                    - The model is a model provided by the library (loaded with the *model id* string of a pretrained
-                      model).
-                    - The model was saved using [`~PreTrainedModel.save_pretrained`] and is reloaded by supplying the
-                      save directory.
-                    - The model is loaded by supplying a local directory as `pretrained_model_name_or_path` and a
-                      configuration JSON file named *config.json* is found in the directory.
             cache_dir (`Union[str, os.PathLike]`, *optional*):
                 Path to a directory in which a downloaded pretrained model configuration should be cached if the
                 standard cache should not be used.
-            from_pt (`bool`, *optional*, defaults to `False`):
-                Load the model weights from a PyTorch checkpoint save file (see docstring of
-                `pretrained_model_name_or_path` argument).
             ignore_mismatched_sizes (`bool`, *optional*, defaults to `False`):
                 Whether or not to raise an error if some of the weights from the checkpoint do not have the same size
                 as the weights of the model (if for instance, you are instantiating a model with 10 labels from a
@@ -287,26 +258,24 @@ class FlaxModelMixin:
                       underlying model's `__init__` method (we assume all relevant updates to the configuration have
                       already been done)
                     - If a configuration is not provided, `kwargs` will be first passed to the configuration class
-                      initialization function ([`~PretrainedConfig.from_pretrained`]). Each key of `kwargs` that
-                      corresponds to a configuration attribute will be used to override said attribute with the
-                      supplied `kwargs` value. Remaining keys that do not correspond to any configuration attribute
-                      will be passed to the underlying model's `__init__` function.
+                      initialization function ([`~ConfigMixin.from_config`]). Each key of `kwargs` that corresponds to
+                      a configuration attribute will be used to override said attribute with the supplied `kwargs`
+                      value. Remaining keys that do not correspond to any configuration attribute will be passed to the
+                      underlying model's `__init__` function.
 
         Examples:
 
         ```python
-        >>> from transformers import BertConfig, FlaxBertModel
+        >>> from diffusers import FlaxUNet2DConditionModel
 
         >>> # Download model and configuration from huggingface.co and cache.
-        >>> model = FlaxBertModel.from_pretrained("bert-base-cased")
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4")
         >>> # Model was saved using *save_pretrained('./test/saved_model/')* (for example purposes, not runnable).
-        >>> model = FlaxBertModel.from_pretrained("./test/saved_model/")
-        >>> # Loading from a PyTorch checkpoint file instead of a PyTorch model (slower, for example purposes, not runnable).
-        >>> config = BertConfig.from_json_file("./pt_model/config.json")
-        >>> model = FlaxBertModel.from_pretrained("./pt_model/pytorch_model.bin", from_pt=True, config=config)
+        >>> model, params = FlaxUNet2DConditionModel.from_pretrained("./test/saved_model/")
         ```"""
         config = kwargs.pop("config", None)
         cache_dir = kwargs.pop("cache_dir", DIFFUSERS_CACHE)
+        ignore_mismatched_sizes = kwargs.pop("ignore_mismatched_sizes", False)
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
@@ -315,6 +284,7 @@ class FlaxModelMixin:
         revision = kwargs.pop("revision", None)
         from_auto_class = kwargs.pop("_from_auto", False)
         subfolder = kwargs.pop("subfolder", None)
+        prng_key = kwargs.pop("prng_key", None)
 
         user_agent = {"file_type": "model", "framework": "flax", "from_auto_class": from_auto_class}
 
@@ -429,6 +399,82 @@ class FlaxModelMixin:
         # flatten dicts
         state = flatten_dict(state)
 
+        prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+        params_shape_tree = jax.eval_shape(model.init_weights, prng_key)
+        required_params = set(flatten_dict(unfreeze(params_shape_tree)).keys())
+
+        random_state = flatten_dict(unfreeze(params_shape_tree))
+
+        missing_keys = required_params - set(state.keys())
+        unexpected_keys = set(state.keys()) - required_params
+
+        if missing_keys:
+            logger.warning(
+                f"The checkpoint {pretrained_model_name_or_path} is missing required keys: {missing_keys}. "
+                "Make sure to call model.init_weights to initialize the missing weights."
+            )
+            cls._missing_keys = missing_keys
+
+        # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
+        # matching the weights in the model.
+        mismatched_keys = []
+        for key in state.keys():
+            if key in random_state and state[key].shape != random_state[key].shape:
+                if ignore_mismatched_sizes:
+                    mismatched_keys.append((key, state[key].shape, random_state[key].shape))
+                    state[key] = random_state[key]
+                else:
+                    raise ValueError(
+                        f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
+                        f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
+                        "Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
+                        "model."
+                    )
+
+        # remove unexpected keys to not be saved again
+        for unexpected_key in unexpected_keys:
+            del state[unexpected_key]
+
+        if len(unexpected_keys) > 0:
+            logger.warning(
+                f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when"
+                f" initializing {model.__class__.__name__}: {unexpected_keys}\n- This IS expected if you are"
+                f" initializing {model.__class__.__name__} from the checkpoint of a model trained on another task or"
+                " with another architecture (e.g. initializing a BertForSequenceClassification model from a"
+                " BertForPreTraining model).\n- This IS NOT expected if you are initializing"
+                f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
+                " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
+            )
+        else:
+            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
+
+        if len(missing_keys) > 0:
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
+                " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
+            )
+        elif len(mismatched_keys) == 0:
+            logger.info(
+                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path}.\nIf your task is similar to the task the model of the checkpoint"
+                f" was trained on, you can already use {model.__class__.__name__} for predictions without further"
+                " training."
+            )
+        if len(mismatched_keys) > 0:
+            mismatched_warning = "\n".join(
+                [
+                    f"- {key}: found shape {shape1} in the checkpoint and {shape2} in the model instantiated"
+                    for key, shape1, shape2 in mismatched_keys
+                ]
+            )
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized because the shapes did not"
+                f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
+                " to use it for predictions and inference."
+            )
+
         # dictionary of key: dtypes for the model params
         param_dtypes = jax.tree_map(lambda x: x.dtype, state)
         # extract keys of parameters not in jnp.float32
@@ -459,28 +505,20 @@ class FlaxModelMixin:
         save_directory: Union[str, os.PathLike],
         params: Union[Dict, FrozenDict],
         is_main_process: bool = True,
-        **kwargs,
     ):
         """
         Save a model and its configuration file to a directory, so that it can be re-loaded using the
-        `[`~FlaxPreTrainedModel.from_pretrained`]` class method
+        `[`~FlaxModelMixin.from_pretrained`]` class method
 
         Arguments:
             save_directory (`str` or `os.PathLike`):
                 Directory to which to save. Will be created if it doesn't exist.
-            push_to_hub (`bool`, *optional*, defaults to `False`):
-                Whether or not to push your model to the Hugging Face model hub after saving it.
-
-                <Tip warning={true}>
-
-                Using `push_to_hub=True` will synchronize the repository you are pushing to with `save_directory`,
-                which requires `save_directory` to be a local clone of the repo you are pushing to if it's an existing
-                folder. Pass along `temp_dir=True` to use a temporary directory instead.
-
-                </Tip>
-
-            kwargs:
-                Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
+            params (`Union[Dict, FrozenDict]`):
+                A `PyTree` of model parameters.
+            is_main_process (`bool`, *optional*, defaults to `True`):
+                Whether the process calling this is the main process or not. Useful when in distributed training like
+                TPUs and need to call this function on all processes. In this case, set `is_main_process=True` only on
+                the main process to avoid race conditions.
         """
         if os.path.isfile(save_directory):
             logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
@@ -502,43 +540,3 @@ class FlaxModelMixin:
             f.write(model_bytes)
 
         logger.info(f"Model weights saved in {output_model_file}")
-
-
-def flax_register_to_config(cls):
-    original_init = cls.__init__
-
-    @functools.wraps(original_init)
-    def init(self, *args, **kwargs):
-        # Ignore private kwargs in the init.
-        init_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_")}
-        # original_init(self, *args, **init_kwargs)
-        if not isinstance(self, ConfigMixin):
-            raise RuntimeError(
-                f"`@register_for_config` was applied to {self.__class__.__name__} init method, but this class does "
-                "not inherit from `ConfigMixin`."
-            )
-
-        ignore = getattr(self, "ignore_for_config", [])
-        # Get positional arguments aligned with kwargs
-        new_kwargs = {}
-        signature = inspect.signature(init)
-        parameters = {
-            name: p.default for i, (name, p) in enumerate(signature.parameters.items()) if i > 0 and name not in ignore
-        }
-        for arg, name in zip(args, parameters.keys()):
-            new_kwargs[name] = arg
-
-        # Then add all kwargs
-        new_kwargs.update(
-            {
-                k: init_kwargs.get(k, default)
-                for k, default in parameters.items()
-                if k not in ignore and k not in new_kwargs
-            }
-        )
-        getattr(self, "register_to_config")(**new_kwargs)
-
-        original_init(self, *args, **init_kwargs)
-
-    cls.__init__ = init
-    return cls
