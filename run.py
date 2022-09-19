@@ -63,7 +63,6 @@ pipe = StableDiffusionPipeline(text_encoder=clip_model, tokenizer=tokenizer, une
 num_samples = 8
 p = "A cinematic film still of Morgan Freeman starring as Jimi Hendrix, portrait, 40mm lens, shallow depth of field, close up, split lighting, cinematic"
 p = "a photograph of an astronaut riding a horse"
-p = "a naked kid"
 
 input_ids = tokenizer(
     [p] * num_samples, padding="max_length", truncation=True, max_length=77, return_tensors="jax"
