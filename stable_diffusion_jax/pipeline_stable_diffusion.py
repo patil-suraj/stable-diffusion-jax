@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from PIL import Image
 from transformers import CLIPTokenizer, FlaxCLIPTextModel
 
-from stable_diffusion_jax.scheduling_pndm import PNDMScheduler
+from stable_diffusion_jax.scheduling_pndm import PNDMSchedulerState
 
 
 @flax.struct.dataclass
@@ -13,6 +13,7 @@ class InferenceState:
     text_encoder_params: flax.core.FrozenDict
     unet_params: flax.core.FrozenDict
     vae_params: flax.core.FrozenDict
+    scheduler_state: PNDMSchedulerState
 
 
 class StableDiffusionPipeline:
@@ -41,13 +42,9 @@ class StableDiffusionPipeline:
         uncond_input_ids: jnp.ndarray,
         prng_seed: jax.random.PRNGKey,
         inference_state: InferenceState,
-        num_inference_steps: int = 50,
         guidance_scale: float = 1.0,
         debug: bool = False,
     ):
-
-        self.scheduler.set_timesteps(num_inference_steps, offset=1)
-
         text_embeddings = self.text_encoder(input_ids, params=inference_state.text_encoder_params)[0]
         uncond_embeddings = self.text_encoder(uncond_input_ids, params=inference_state.text_encoder_params)[0]
         context = jnp.concatenate([uncond_embeddings, text_embeddings])
@@ -60,13 +57,14 @@ class StableDiffusionPipeline:
         )
         latents = jax.random.normal(prng_seed, shape=latents_shape, dtype=jnp.float32)
 
-        def loop_body(step, latents):
+        def loop_body(step, args):
+            latents, scheduler_state = args
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             latents_input = jnp.concatenate([latents] * 2)
 
-            t = jnp.array(self.scheduler.timesteps)[step]
+            t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
             timestep = jnp.broadcast_to(t, latents_input.shape[0])
 
             # predict the noise residual
@@ -78,15 +76,18 @@ class StableDiffusionPipeline:
             noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
 
             # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents)["prev_sample"]
-            return latents
+            latents, scheduler_state = self.scheduler.step(scheduler_state, noise_pred, t, latents)
+            latents = latents["prev_sample"]
+            return latents, scheduler_state
 
+        scheduler_state = inference_state.scheduler_state
+        num_inference_steps = len(scheduler_state.timesteps)
         if debug:
             # run with python for loop
             for i in range(num_inference_steps):
-                latents = loop_body(i, latents)
+                latents, scheduler_state = loop_body(i, (latents, scheduler_state))
         else:
-            latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
+            latents, _ = jax.lax.fori_loop(0, num_inference_steps, loop_body, (latents, scheduler_state))
 
         # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
