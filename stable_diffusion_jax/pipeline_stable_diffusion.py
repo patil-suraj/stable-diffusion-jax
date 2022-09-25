@@ -81,12 +81,13 @@ class StableDiffusionPipeline:
             latents = self.scheduler.step(noise_pred, t, latents)["prev_sample"]
             return latents
 
+        scheduler_steps = len(self.scheduler.timesteps)     # num_inference_steps + 1
         if debug:
             # run with python for loop
-            for i in range(num_inference_steps):
+            for i in range(scheduler_steps):
                 latents = loop_body(i, latents)
         else:
-            latents = jax.lax.fori_loop(0, num_inference_steps, loop_body, latents)
+            latents = jax.lax.fori_loop(0, scheduler_steps, loop_body, latents)
 
         # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
